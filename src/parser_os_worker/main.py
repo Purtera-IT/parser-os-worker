@@ -195,17 +195,51 @@ def _do_compile(
     manifest: dict[str, Any],
     blob_service: BlobServiceClient,
 ) -> dict[str, Any]:
-    """Run parser-os compile_project, returning the envelope dict.
+    """Run parser-os compile_project, write envelope.json + scope-process-v1
+    sidecar + SOW_DRAFT.md + compile-trace.json, return summary.
 
-    Mirrors parser-os-service's _run_compile_project, but without the
-    HTTP-request lifetime constraints.
+    Mirrors parser-os-service /v1/orbitbrief/rebuild-latest in shape (uses the
+    canonical build_orbitbrief_envelope for envelope.json — to_scope_process_v1
+    is for DB persistence, NOT for the envelope blob), plus the v45.2 split-out
+    SowSmith render + structured compile trace.
     """
     from app.core.compiler import compile_project  # parser-os (installed via pyproject)
+    from app.core.orbitbrief_envelope import build_orbitbrief_envelope  # type: ignore
     from parser_os_service.server.projector import to_scope_process_v1  # type: ignore
+    import app.core.multi_entity_llm as _llm_mod1  # type: ignore
+    import app.core.site_llm_verify as _llm_mod2  # type: ignore
 
+    t_start = time.time()
+    started_at = _iso_now()
     work_root = Path(tempfile.mkdtemp(prefix=f"parser-os-worker-{job.compile_id}-"))
     project_dir = work_root / "project"
     project_dir.mkdir(parents=True, exist_ok=True)
+
+    # Compile trace: monkey-patch _call_ollama in both call sites so we record
+    # every LLM HTTP call (model, sizes, latency) for byte-identical diff vs
+    # Mac local.  Restored in finally to avoid cross-invocation leakage.
+    llm_calls: list[dict[str, Any]] = []
+
+    def _make_wrapper(original, source: str):
+        def wrapped(prompt: str, *, max_tokens: int = 1024) -> str:
+            t0 = time.time()
+            response = original(prompt, max_tokens=max_tokens)
+            llm_calls.append({
+                "ts": _iso_now(),
+                "source": source,
+                "prompt_size": len(prompt),
+                "max_tokens": max_tokens,
+                "response_size": len(response or ""),
+                "latency_sec": round(time.time() - t0, 3),
+                "model": os.environ.get("OLLAMA_MODEL", "qwen3:14b"),
+            })
+            return response
+        return wrapped
+
+    _orig_call_1 = _llm_mod1._call_ollama
+    _orig_call_2 = _llm_mod2._call_ollama
+    _llm_mod1._call_ollama = _make_wrapper(_orig_call_1, "multi_entity_llm")
+    _llm_mod2._call_ollama = _make_wrapper(_orig_call_2, "site_llm_verify")
 
     try:
         # 1. Download artifacts referenced by manifest into project_dir.
@@ -250,31 +284,138 @@ def _do_compile(
         elapsed = time.time() - t0
         log.info("compile_project done in %.1fs", elapsed)
 
-        # 4. Build envelope via projector
+        # 4a. Build canonical OrbitBrief envelope (atoms/entities/cockpit
+        # surfaces).  THIS is what brief gen and SowSmith read.
         _write_status(
             blob_service, job, "running",
-            stage="projection", percent_complete=90,
+            stage="projection", percent_complete=85,
             entity_count=len(result.entities),
             atom_count=len(result.atoms),
         )
-        envelope = to_scope_process_v1(
-            result,
-            manifest=manifest,
-            manifest_blob_url=job.manifest_blob_url,
+        envelope = build_orbitbrief_envelope(
+            project_dir=project_dir, compile_result=result,
         )
         envelope["compile_id"] = job.compile_id
 
-        # 5. Upload
-        path = _upload_envelope(blob_service, job.deal_id, envelope)
-        log.info("Uploaded envelope to %s", path)
+        # 4b. Also produce scope_process_v1 (DB persistence shape — different
+        # from envelope).  Uploaded as a sidecar so the Function App queue
+        # trigger can persist it to opportunities.quote_data.scope_process_v1.
+        scope_process_v1 = to_scope_process_v1(
+            result, manifest=manifest, manifest_blob_url=job.manifest_blob_url,
+        )
+
+        # 5a. Upload envelope.json
+        env_path = _upload_envelope(blob_service, job.deal_id, envelope)
+        log.info("Uploaded envelope to %s", env_path)
+
+        # 5b. Upload scope-process-v1.json sidecar
+        try:
+            scope_path = f"deals/{job.deal_id}/orbitbrief/latest/scope-process-v1.json"
+            blob_service.get_blob_client(
+                container=BLOB_CONTAINER, blob=scope_path,
+            ).upload_blob(
+                json.dumps(scope_process_v1, indent=2, ensure_ascii=False).encode("utf-8"),
+                overwrite=True,
+                content_type="application/json",
+            )
+            log.info("Uploaded scope-process-v1 sidecar to %s", scope_path)
+        except Exception as exc:
+            log.warning("scope-process-v1 sidecar upload failed: %s", exc)
+
+        # 5c. SowSmith — deterministic SOW render from envelope.  Sub-second,
+        # no LLM, no dependencies.  Decoupled from Orbitbrief-Core brief gen.
+        sow_version: str | None = None
+        try:
+            from sowsmith import build_sow_markdown, SOW_VERSION  # type: ignore
+            sow_md = build_sow_markdown(envelope)
+            sow_path = f"deals/{job.deal_id}/orbitbrief/latest/SOW_DRAFT.md"
+            blob_service.get_blob_client(
+                container=BLOB_CONTAINER, blob=sow_path,
+            ).upload_blob(
+                sow_md.encode("utf-8"),
+                overwrite=True,
+                content_type="text/markdown; charset=utf-8",
+            )
+            sow_version = SOW_VERSION
+            log.info(
+                "SowSmith %s wrote SOW_DRAFT.md (%d chars) for deal=%s",
+                SOW_VERSION, len(sow_md), job.deal_id,
+            )
+        except Exception as exc:
+            log.warning("SowSmith SOW render failed: %s", exc)
+
+        # 5d. Compile trace — stage timeline + every LLM call.  For
+        # byte-identical-pipeline verification against Mac local: same stage
+        # names, same atom/entity counts, same LLM call counts per source/model
+        # → same pipeline ran.  Latencies will differ (Tailscale overhead).
+        try:
+            from dataclasses import asdict as _asdict, is_dataclass as _is_dc
+            parser_trace = None
+            if hasattr(result, "trace") and result.trace is not None:
+                if _is_dc(result.trace):
+                    parser_trace = _asdict(result.trace)
+                elif hasattr(result.trace, "__dict__"):
+                    parser_trace = dict(result.trace.__dict__)
+
+            by_source: dict[str, int] = {}
+            by_model: dict[str, int] = {}
+            total_latency = 0.0
+            for c in llm_calls:
+                by_source[c["source"]] = by_source.get(c["source"], 0) + 1
+                by_model[c["model"]] = by_model.get(c["model"], 0) + 1
+                total_latency += c["latency_sec"]
+
+            trace_payload = {
+                "compile_id": job.compile_id,
+                "deal_id": job.deal_id,
+                "worker_sha": WORKER_SHA,
+                "parser_os_sha": PARSER_OS_SHA,
+                "sow_version": sow_version,
+                "started_at": started_at,
+                "finished_at": _iso_now(),
+                "wall_clock_sec": round(time.time() - t_start, 3),
+                "compile_elapsed_sec": round(elapsed, 3),
+                "entity_count": len(getattr(result, "entities", []) or []),
+                "atom_count": len(getattr(result, "atoms", []) or []),
+                "llm_calls": llm_calls,
+                "llm_call_summary": {
+                    "total_calls": len(llm_calls),
+                    "total_latency_sec": round(total_latency, 3),
+                    "by_source": by_source,
+                    "by_model": by_model,
+                },
+                "parser_trace": parser_trace,
+            }
+            trace_path = f"deals/{job.deal_id}/orbitbrief/latest/compile-trace.json"
+            blob_service.get_blob_client(
+                container=BLOB_CONTAINER, blob=trace_path,
+            ).upload_blob(
+                json.dumps(trace_payload, indent=2, default=str).encode("utf-8"),
+                overwrite=True,
+                content_type="application/json",
+            )
+            log.info(
+                "Wrote compile-trace.json (%d LLM calls, %.1fs total LLM latency)",
+                len(llm_calls), total_latency,
+            )
+        except Exception as exc:
+            log.warning("compile-trace upload failed: %s", exc)
 
         return {
-            "envelope_path": path,
+            "envelope_path": env_path,
             "entity_count": len(result.entities),
             "atom_count": len(result.atoms),
             "elapsed_sec": elapsed,
+            "sow_version": sow_version,
+            "llm_call_count": len(llm_calls),
         }
     finally:
+        # Restore monkey-patched call sites and clean tempdir.
+        try:
+            _llm_mod1._call_ollama = _orig_call_1
+            _llm_mod2._call_ollama = _orig_call_2
+        except Exception:
+            pass
         shutil.rmtree(work_root, ignore_errors=True)
 
 
