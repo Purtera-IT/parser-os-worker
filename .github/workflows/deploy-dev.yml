@@ -1,0 +1,109 @@
+name: Deploy parser-os-worker to dev
+
+# Push this file to Purtera-IT/parser-os-worker as
+# .github/workflows/deploy-dev.yml
+#
+# Triggered on push to main.  Builds the worker image in ACR with all 3
+# sibling repos (parser-os, parser-os-service, parser-os-worker) in the
+# build context, then updates the Container Apps Job to the new digest.
+#
+# Required GitHub secrets (Settings → Secrets and variables → Actions):
+#   AZURE_TENANT_ID:       f793fa28-2504-447d-893e-f314c51c54de
+#   AZURE_CLIENT_ID:       87c3259e-ed41-4a19-a4fc-86e1b575e31f
+#   AZURE_SUBSCRIPTION_ID: cd493e42-9cd6-4849-975a-3fbeb7fd93d1
+#
+# Federated cred already added to platform-infra-github-actions:
+#   github-parser-os-worker-ref-main
+#   Subject: repo:Purtera-IT/parser-os-worker:ref:refs/heads/main
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      parser_os_ref:
+        description: parser-os ref to bundle (default v45.2)
+        required: false
+        default: v45.2
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ACR_NAME: purpulsedevacr
+  ACR_REGISTRY: purpulsedevacr.azurecr.io
+  IMAGE_NAME: parser-os-worker
+  ENV_TAG: dev
+  JOB_NAME: parser-os-worker-dev-eus2
+  JOB_RG: purtera-dev-rg
+  PARSER_OS_REPO: https://github.com/Purtera-IT/parser-os.git
+  PARSER_OS_SERVICE_REPO: https://github.com/Purtera-IT/parser-os-service.git
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout parser-os-worker
+        uses: actions/checkout@v4
+        with:
+          path: parser-os-worker
+
+      - name: Resolve parser-os ref to SHA
+        id: pos
+        run: |
+          REF="${{ github.event.inputs.parser_os_ref || 'v45.2' }}"
+          echo "ref=$REF" >> $GITHUB_OUTPUT
+          SHA=$(git ls-remote ${{ env.PARSER_OS_REPO }} "$REF" | awk '{print $1}' | head -n 1)
+          if [[ -z "$SHA" && "$REF" =~ ^[a-f0-9]{7,40}$ ]]; then SHA="$REF"; fi
+          if [[ -z "$SHA" ]]; then echo "::error::Could not resolve '$REF'"; exit 1; fi
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Clone parser-os + parser-os-service into build context
+        run: |
+          git clone --depth 1 ${{ env.PARSER_OS_REPO }} parser-os
+          git -C parser-os fetch origin ${{ steps.pos.outputs.sha }}
+          git -C parser-os checkout ${{ steps.pos.outputs.sha }}
+          git clone --depth 1 ${{ env.PARSER_OS_SERVICE_REPO }} parser-os-service
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR build
+        run: |
+          az acr build \
+            --registry ${{ env.ACR_NAME }} \
+            --image "${{ env.IMAGE_NAME }}:${{ env.ENV_TAG }}" \
+            --image "${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA:0:12}" \
+            --file parser-os-worker/Dockerfile \
+            --build-arg "GIT_SHA=${{ github.sha }}" \
+            --build-arg "PARSER_OS_SHA=${{ steps.pos.outputs.sha }}" \
+            --build-arg "BUILD_LABEL=${{ steps.pos.outputs.ref }}" \
+            --no-format \
+            .
+
+      - name: Resolve new digest
+        id: img
+        run: |
+          DIGEST=$(az acr manifest list-metadata \
+            --name ${{ env.IMAGE_NAME }} --registry ${{ env.ACR_NAME }} \
+            -o json | python -c "import json,sys; arr=json.load(sys.stdin); m=[x for x in arr if 'dev' in (x.get('tags') or [])]; print(m[0]['digest'])")
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+
+      - name: Roll Container Apps Job
+        run: |
+          az containerapp job update \
+            --name ${{ env.JOB_NAME }} \
+            --resource-group ${{ env.JOB_RG }} \
+            --image "${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.img.outputs.digest }}"
+
+      - name: Smoke (enqueue a no-op probe)
+        run: |
+          # A simple verification could go here once we add a /healthz path
+          # or a probe-style queue message that the worker handles specially.
+          echo "Deployed image @${{ steps.img.outputs.digest }} — next compile message will use it"
