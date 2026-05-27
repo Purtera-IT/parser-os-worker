@@ -30,10 +30,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -u 10001 parserosworker
 WORKDIR /build
 
-# Copy parser-os and parser-os-service (worker reuses projector) as siblings
+# Copy parser-os and parser-os-service (worker reuses projector) as siblings.
+# SowSmith — separate library, copied as local source so we don't depend on
+# git clone at build time (ACR build agent isn't reliably outbound for git).
 COPY parser-os ./parser-os
 COPY parser-os-service ./parser-os-service
 COPY parser-os-worker ./parser-os-worker
+COPY SowSmith ./SowSmith
 
 ENV PIP_ROOT_USER_ACTION=ignore
 
@@ -69,12 +72,7 @@ RUN set -eux; \
       "opencv-python-headless>=4.9" \
       "Pillow>=10.0" \
       "pypdfium2>=4.30"; \
-    # SowSmith — deterministic SOW renderer.  Pinned to a SHA for
-    # reproducibility.  No transitive deps.  Owns SOW_DRAFT.md output.
-    pip install --no-cache-dir \
-      "sowsmith @ git+https://github.com/Purtera-IT/SowSmith.git@a8609c9812c0655d844c360b3a1c51bb6d1402b3"; \
-    # Worker itself (no-deps because pyproject pins parser-os from git — we
-    # already installed from local above)
+    pip install --no-cache-dir ./SowSmith; \
     pip install --no-cache-dir --no-deps ./parser-os-worker; \
     rm -rf /build
 
