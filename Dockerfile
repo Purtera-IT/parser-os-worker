@@ -43,14 +43,32 @@ RUN set -eux; \
     pip install --no-cache-dir ./parser-os; \
     # Install parser-os-service (need projector — no extra deps)
     pip install --no-cache-dir --no-deps ./parser-os-service; \
-    # parser-os-service deps that the projector needs
+    # Belt-and-suspenders: explicit dep list matching orbitbrief-core-worker's
+    # set so missing-transitively-required modules can't break us silently.
     pip install --no-cache-dir \
       "azure-identity>=1.15" \
       "azure-storage-blob>=12.19" \
       "azure-storage-queue>=12.10" \
       "fastapi>=0.110" \
       "pydantic>=2.5" \
-      "structlog>=24.1"; \
+      "structlog>=24.1" \
+      "PyYAML>=6.0.1" \
+      "openpyxl>=3.1.2" \
+      "jsonschema>=4.23.0" \
+      "httpx>=0.27.0" \
+      "requests>=2.31.0" \
+      "sqlmodel>=0.0.16" \
+      "python-docx>=1.1" \
+      "beautifulsoup4>=4.12" \
+      "typer>=0.12" \
+      "rich>=13.0" \
+      "rapidfuzz>=3.0" \
+      "numpy>=1.26" \
+      "scikit-learn>=1.3" \
+      "PyMuPDF>=1.24" \
+      "opencv-python-headless>=4.9" \
+      "Pillow>=10.0" \
+      "pypdfium2>=4.30"; \
     # Worker itself (no-deps because pyproject pins parser-os from git — we
     # already installed from local above)
     pip install --no-cache-dir --no-deps ./parser-os-worker; \
