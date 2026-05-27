@@ -50,22 +50,30 @@ jobs:
         with:
           path: parser-os-worker
 
-      - name: Resolve parser-os ref to SHA
+      - name: Checkout parser-os
+        uses: actions/checkout@v4
+        with:
+          repository: Purtera-IT/parser-os
+          ref: ${{ github.event.inputs.parser_os_ref || 'main' }}
+          path: parser-os
+          token: ${{ secrets.GH_REPO_TOKEN }}
+
+      - name: Checkout parser-os-service
+        uses: actions/checkout@v4
+        with:
+          repository: Purtera-IT/parser-os-service
+          ref: main
+          path: parser-os-service
+          token: ${{ secrets.GH_REPO_TOKEN }}
+
+      - name: Capture parser-os SHA
         id: pos
         run: |
-          REF="${{ github.event.inputs.parser_os_ref || 'v45.2' }}"
-          echo "ref=$REF" >> $GITHUB_OUTPUT
-          SHA=$(git ls-remote ${{ env.PARSER_OS_REPO }} "$REF" | awk '{print $1}' | head -n 1)
-          if [[ -z "$SHA" && "$REF" =~ ^[a-f0-9]{7,40}$ ]]; then SHA="$REF"; fi
-          if [[ -z "$SHA" ]]; then echo "::error::Could not resolve '$REF'"; exit 1; fi
+          SHA=$(git -C parser-os rev-parse HEAD)
+          REF="${{ github.event.inputs.parser_os_ref || 'main' }}"
           echo "sha=$SHA" >> $GITHUB_OUTPUT
-
-      - name: Clone parser-os + parser-os-service into build context
-        run: |
-          git clone --depth 1 ${{ env.PARSER_OS_REPO }} parser-os
-          git -C parser-os fetch origin ${{ steps.pos.outputs.sha }}
-          git -C parser-os checkout ${{ steps.pos.outputs.sha }}
-          git clone --depth 1 ${{ env.PARSER_OS_SERVICE_REPO }} parser-os-service
+          echo "ref=$REF" >> $GITHUB_OUTPUT
+          echo "Bundled parser-os $REF @ $SHA"
 
       - name: Azure login (OIDC)
         uses: azure/login@v2
