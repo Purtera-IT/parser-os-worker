@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
-from azure.storage.queue import QueueServiceClient
+from azure.storage.queue import QueueServiceClient, TextBase64EncodePolicy
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 
@@ -40,6 +40,11 @@ VISIBILITY_TIMEOUT_SEC = int(os.environ.get("MESSAGE_VISIBILITY_TIMEOUT_SEC", "1
 MAX_DEQUEUE_COUNT = int(os.environ.get("MAX_DEQUEUE_COUNT", "3"))  # poison after 3 retries
 WORKER_SHA = os.environ.get("PARSER_OS_WORKER_SHA", "unknown")
 PARSER_OS_SHA = os.environ.get("PARSER_OS_SHA", "unknown")
+# v45.2: queue to notify brief-gen worker that a fresh envelope is ready.
+# Empty string disables (worker won't enqueue; useful for ad-hoc replays).
+BRIEF_GEN_QUEUE_NAME = os.environ.get(
+    "BRIEF_GEN_QUEUE_NAME", "parser-os-orbitbrief-jobs"
+)
 # Prefer connection string (avoids needing Storage Data Contributor role on the
 # managed identity).  Falls back to DefaultAzureCredential when not set.
 CONNECTION_STRING = os.environ.get("AZURE_STORAGE_CONNECTION_STRING") or \
@@ -148,6 +153,38 @@ def _upload_envelope(
         content_type="application/json",
     )
     return path
+
+
+def _enqueue_brief_gen(
+    queue_service: QueueServiceClient, job: "JobMessage"
+) -> None:
+    """Notify the brief-gen queue (parser-os-orbitbrief-jobs) that a fresh
+    v45.2 envelope has been written.  Function App queueTrigger picks this up
+    with envelopeReady:true and skips its inline regex-only rebuild step,
+    going straight to brief-gen against the fresh envelope.
+
+    Message format matches what the Function App enqueueJson helper writes:
+    base64-encoded JSON, fields dealId + compileId + envelopeReady.
+    """
+    if not BRIEF_GEN_QUEUE_NAME:
+        log.info("BRIEF_GEN_QUEUE_NAME unset; skipping brief-gen enqueue.")
+        return
+    bqc = queue_service.get_queue_client(
+        BRIEF_GEN_QUEUE_NAME,
+        message_encode_policy=TextBase64EncodePolicy(),
+    )
+    payload = {
+        "dealId": job.deal_id,
+        "compileId": job.compile_id,
+        "envelopeReady": True,
+    }
+    bqc.send_message(json.dumps(payload))
+    log.info(
+        "Enqueued brief-gen for deal=%s compile=%s on %s",
+        job.deal_id,
+        job.compile_id,
+        BRIEF_GEN_QUEUE_NAME,
+    )
 
 
 # ─── The actual compile ───────────────────────────────────────────────────
@@ -330,6 +367,17 @@ def main() -> int:
             elapsed_sec=round(result["elapsed_sec"], 2),
             envelope_path=result["envelope_path"],
         )
+
+        # Notify brief-gen worker that a fresh v45.2 envelope is ready.
+        # Best-effort — log loudly on failure but don't fail the compile job.
+        try:
+            _enqueue_brief_gen(queue_service, job)
+        except Exception as exc:
+            log.warning(
+                "Brief-gen enqueue failed for deal=%s compile=%s: %s",
+                job.deal_id, job.compile_id, exc,
+            )
+
         queue_client.delete_message(msg)
         log.info("Job complete: compile_id=%s", job.compile_id)
         return 0
