@@ -18,13 +18,22 @@
 
 FROM python:3.11-slim AS runtime
 
-# Install OS deps that parser-os needs for OCR + image rendering at compile time
+# v51: install tailscale + curl + iptables so the worker can join the
+# tailnet at startup and reach Mac Studio Ollama directly via
+# 100.114.102.122:11434 — bypasses the broken HTTPS proxy that drops
+# responses mid-stream (IncompleteRead). Same pattern as
+# orbitbrief-core-worker (Platform-infra task #19).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         poppler-utils \
         tesseract-ocr \
         libgl1 \
         libglib2.0-0 \
+        ca-certificates \
+        curl \
+        iptables \
+    && curl -fsSL https://tailscale.com/install.sh | sh \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -u 10001 parserosworker
@@ -92,11 +101,25 @@ RUN echo "$GIT_SHA" > /app/.git_sha \
  && echo "$BUILD_LABEL" > /app/.build_label \
  && chown parserosworker:parserosworker /app/.git_sha /app/.parser_os_sha /app/.build_label
 
-USER parserosworker
+# v51: copy the tailscale entrypoint. Mirrors orbitbrief-core-worker.
+# The entrypoint joins the tailnet, exports HTTP_PROXY/HTTPS_PROXY so
+# urllib (used by parser-os LLM clients) routes through the local
+# tailscaled HTTP-CONNECT proxy, then execs the worker.
+COPY parser-os-worker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-# This is a Job, not a server — no port to expose, no health check needed.
-# Container Apps Jobs let the process exit cleanly when done.
+# Don't set HTTP_PROXY here: tailscaled must reach controlplane before
+# the proxy listens. entrypoint.sh exports them after `tailscale up`.
+ENV TS_STATE_DIR=/var/lib/tailscale \
+    TS_ACCEPT_DNS=false
+
+# Tailscale needs to write state — run as root inside the container.
+# parser-os already runs in a sandboxed Container App so this is fine.
+# USER parserosworker  # disabled for tailscaled state writes
+
 ENV PYTHONUNBUFFERED=1
 
+# Entrypoint joins tailnet, then exec the worker.
+ENTRYPOINT ["/entrypoint.sh"]
 # One process = one message = exit.  Container Apps Jobs + KEDA handle the rest.
 CMD ["python", "-m", "parser_os_worker.main"]
