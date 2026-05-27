@@ -40,6 +40,10 @@ VISIBILITY_TIMEOUT_SEC = int(os.environ.get("MESSAGE_VISIBILITY_TIMEOUT_SEC", "1
 MAX_DEQUEUE_COUNT = int(os.environ.get("MAX_DEQUEUE_COUNT", "3"))  # poison after 3 retries
 WORKER_SHA = os.environ.get("PARSER_OS_WORKER_SHA", "unknown")
 PARSER_OS_SHA = os.environ.get("PARSER_OS_SHA", "unknown")
+# Prefer connection string (avoids needing Storage Data Contributor role on the
+# managed identity).  Falls back to DefaultAzureCredential when not set.
+CONNECTION_STRING = os.environ.get("AZURE_STORAGE_CONNECTION_STRING") or \
+    os.environ.get("ORBITBRIEF_ARTIFACTS_CONNECTION_STRING")
 
 
 # ─── Logging setup ─────────────────────────────────────────────────────────
@@ -243,15 +247,21 @@ def main() -> int:
         PARSER_OS_SHA,
     )
 
-    cred = DefaultAzureCredential()
-    queue_service = QueueServiceClient(
-        account_url=f"https://{ACCOUNT_NAME}.queue.core.windows.net",
-        credential=cred,
-    )
-    blob_service = BlobServiceClient(
-        account_url=f"https://{ACCOUNT_NAME}.blob.core.windows.net",
-        credential=cred,
-    )
+    if CONNECTION_STRING:
+        log.info("Using connection-string auth for Storage.")
+        queue_service = QueueServiceClient.from_connection_string(CONNECTION_STRING)
+        blob_service = BlobServiceClient.from_connection_string(CONNECTION_STRING)
+    else:
+        log.info("No AZURE_STORAGE_CONNECTION_STRING; falling back to DefaultAzureCredential.")
+        cred = DefaultAzureCredential()
+        queue_service = QueueServiceClient(
+            account_url=f"https://{ACCOUNT_NAME}.queue.core.windows.net",
+            credential=cred,
+        )
+        blob_service = BlobServiceClient(
+            account_url=f"https://{ACCOUNT_NAME}.blob.core.windows.net",
+            credential=cred,
+        )
     queue_client = queue_service.get_queue_client(QUEUE_NAME)
 
     # Pull ONE message (Container Apps Jobs pattern: one process = one unit of work)
