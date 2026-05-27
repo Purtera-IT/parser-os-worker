@@ -61,6 +61,8 @@ RUN set -eux; \
       "azure-identity>=1.15" \
       "azure-storage-blob>=12.19" \
       "azure-storage-queue>=12.10" \
+      "azure-ai-documentintelligence>=1.0.0b1" \
+      "azure-core>=1.30" \
       "fastapi>=0.110" \
       "pydantic>=2.5" \
       "structlog>=24.1" \
