@@ -220,7 +220,11 @@ def _do_compile(
             entity_count=len(result.entities),
             atom_count=len(result.atoms),
         )
-        envelope = to_scope_process_v1(result, deal_id=job.deal_id)
+        envelope = to_scope_process_v1(
+            result,
+            manifest=manifest,
+            manifest_blob_url=job.manifest_blob_url,
+        )
         envelope["compile_id"] = job.compile_id
 
         # 5. Upload
