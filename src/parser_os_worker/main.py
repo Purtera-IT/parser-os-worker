@@ -420,6 +420,80 @@ def _do_compile(
         )
         _write_status(blob_service, job, "running", stage="compile", percent_complete=10)
 
+        # v57: live compile-progress.json writer — fires after every
+        # parser-os stage so the UI can render an accurate timeline
+        # (current stage + elapsed + ETA) instead of an unbounded spinner.
+        compile_started_iso = _iso_now()
+        progress_path = (
+            f"deals/{job.deal_id}/orbitbrief/latest/compile-progress.json"
+        )
+        progress_started_perf = time.time()
+
+        def _on_stage_end(stage, all_stages):  # type: ignore[no-untyped-def]
+            done = [
+                {
+                    "stage_name": s.stage_name,
+                    "duration_ms": float(s.duration_ms or 0.0),
+                    "input_count": s.input_count,
+                    "output_count": s.output_count,
+                }
+                for s in all_stages
+            ]
+            payload = {
+                "compile_id": job.compile_id,
+                "deal_id": job.deal_id,
+                "status": "running",
+                "current_stage": stage.stage_name,
+                "stages": done,
+                "stage_count_done": len(done),
+                "stage_count_total_estimate": 14,
+                "started_at": compile_started_iso,
+                "updated_at": _iso_now(),
+                "elapsed_ms": int(
+                    (time.time() - progress_started_perf) * 1000.0
+                ),
+                "worker_sha": WORKER_SHA,
+                "parser_os_sha": PARSER_OS_SHA,
+            }
+            try:
+                blob_service.get_blob_client(
+                    container=BLOB_CONTAINER, blob=progress_path,
+                ).upload_blob(
+                    json.dumps(payload, indent=2, default=str).encode("utf-8"),
+                    overwrite=True,
+                    content_type="application/json",
+                )
+            except Exception as exc:  # pragma: no cover — best-effort UX
+                log.warning("compile-progress upload failed: %s", exc)
+
+        # v57: seed compile-progress.json BEFORE compile starts so the
+        # UI's polling hook can render a "starting compile…" state the
+        # moment the page sees a fresh compile_id in flight, instead of
+        # waiting for the first stage to finish.
+        try:
+            blob_service.get_blob_client(
+                container=BLOB_CONTAINER, blob=progress_path,
+            ).upload_blob(
+                json.dumps({
+                    "compile_id": job.compile_id,
+                    "deal_id": job.deal_id,
+                    "status": "starting",
+                    "current_stage": None,
+                    "stages": [],
+                    "stage_count_done": 0,
+                    "stage_count_total_estimate": 14,
+                    "started_at": compile_started_iso,
+                    "updated_at": _iso_now(),
+                    "elapsed_ms": 0,
+                    "worker_sha": WORKER_SHA,
+                    "parser_os_sha": PARSER_OS_SHA,
+                }, indent=2).encode("utf-8"),
+                overwrite=True,
+                content_type="application/json",
+            )
+        except Exception as exc:
+            log.warning("compile-progress (starting) upload failed: %s", exc)
+
         # 3. Compile
         log.info("Starting compile_project (compile_id=%s)", job.compile_id)
         t0 = time.time()
@@ -432,9 +506,46 @@ def _do_compile(
             use_cache=opts.get("use_cache", False),  # default False to honor fresh-compile intent
             abstain_threshold=opts.get("abstain_threshold"),
             persistence_hook=None,
+            stage_callback=_on_stage_end,
         )
         elapsed = time.time() - t0
         log.info("compile_project done in %.1fs", elapsed)
+
+        # v57: mark compile-progress.json as done so the UI stops polling
+        # and can compute a final elapsed total. The 14-stage estimate is
+        # replaced with the real count for accurate progress bar finish.
+        try:
+            final_stages = [
+                {
+                    "stage_name": s.stage_name,
+                    "duration_ms": float(s.duration_ms or 0.0),
+                    "input_count": s.input_count,
+                    "output_count": s.output_count,
+                }
+                for s in getattr(result, "trace", None).stages
+            ] if getattr(result, "trace", None) is not None else []
+            blob_service.get_blob_client(
+                container=BLOB_CONTAINER, blob=progress_path,
+            ).upload_blob(
+                json.dumps({
+                    "compile_id": job.compile_id,
+                    "deal_id": job.deal_id,
+                    "status": "done",
+                    "current_stage": None,
+                    "stages": final_stages,
+                    "stage_count_done": len(final_stages),
+                    "stage_count_total_estimate": len(final_stages) or 14,
+                    "started_at": compile_started_iso,
+                    "updated_at": _iso_now(),
+                    "elapsed_ms": int(elapsed * 1000.0),
+                    "worker_sha": WORKER_SHA,
+                    "parser_os_sha": PARSER_OS_SHA,
+                }, indent=2, default=str).encode("utf-8"),
+                overwrite=True,
+                content_type="application/json",
+            )
+        except Exception as exc:
+            log.warning("compile-progress (done) upload failed: %s", exc)
 
         # 4a. Build canonical OrbitBrief envelope (atoms/entities/cockpit
         # surfaces).  THIS is what brief gen and SowSmith read.
