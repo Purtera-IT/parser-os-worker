@@ -187,6 +187,158 @@ def _enqueue_brief_gen(
     )
 
 
+# v56: Side-channel atoms.json with the raw parser-os atom list — bypasses
+# the OrbitBrief envelope projection (which overlays fixture data on the
+# site_registry field). This is what the Deal Artifacts UI page reads so
+# the PM sees real parser-os output without depending on OrbitBrief at all.
+def _serialize_atom_for_ui(atom: Any) -> dict[str, Any]:
+    """Convert an EvidenceAtom (pydantic model) to the dict shape the UI
+    expects. Pulls every field Template D needs in one pass:
+      atom_type, confidence, verified, raw_text, value, entity_keys,
+      section_path, source_artifact, locator (page/table/row/char ranges).
+    """
+    # atom_type might be an enum — get the string form
+    at = getattr(atom, "atom_type", None)
+    atom_type_str = at.value if hasattr(at, "value") else str(at or "unknown")
+
+    # Pick the canonical source_ref for locator + source artifact
+    srefs = getattr(atom, "source_refs", []) or []
+    primary = srefs[0] if srefs else None
+    locator = {}
+    source_artifact_id = getattr(atom, "artifact_id", "") or ""
+    source_filename = ""
+    extraction_method = ""
+    if primary is not None:
+        loc = getattr(primary, "locator", None) or {}
+        if isinstance(loc, dict):
+            locator = loc
+        source_filename = getattr(primary, "filename", "") or ""
+        extraction_method = getattr(primary, "extraction_method", "") or ""
+        source_artifact_id = getattr(primary, "artifact_id", "") or source_artifact_id
+
+    # section_path lives inside locator for some parsers, top-level for others
+    section_path = locator.get("section_path") if isinstance(locator, dict) else None
+
+    # Verified status: an atom is "verified" if it has any receipt that succeeded.
+    receipts = getattr(atom, "receipts", []) or []
+    verified = False
+    receipt_kinds: list[str] = []
+    for r in receipts:
+        status = getattr(r, "status", None)
+        status_str = status.value if hasattr(status, "value") else str(status or "")
+        kind = getattr(r, "kind", None)
+        kind_str = kind.value if hasattr(kind, "value") else str(kind or "")
+        if kind_str:
+            receipt_kinds.append(kind_str)
+        if status_str.lower() in ("verified", "ok", "supported"):
+            verified = True
+
+    authority_class = getattr(atom, "authority_class", None)
+    authority_str = authority_class.value if hasattr(authority_class, "value") else str(authority_class or "")
+
+    review_status = getattr(atom, "review_status", None)
+    review_str = review_status.value if hasattr(review_status, "value") else str(review_status or "")
+
+    return {
+        "id": getattr(atom, "id", ""),
+        "atom_type": atom_type_str,
+        "confidence": getattr(atom, "confidence", None),
+        "calibrated_confidence": getattr(atom, "calibrated_confidence", None),
+        "verified": verified,
+        "receipt_kinds": receipt_kinds,
+        "authority_class": authority_str,
+        "review_status": review_str,
+        "raw_text": getattr(atom, "raw_text", "") or "",
+        "normalized_text": getattr(atom, "normalized_text", "") or "",
+        "value": getattr(atom, "value", {}) or {},
+        "entity_keys": list(getattr(atom, "entity_keys", []) or []),
+        "section_path": section_path,
+        "source_artifact_id": source_artifact_id,
+        "source_filename": source_filename,
+        "extraction_method": extraction_method,
+        "locator": locator if isinstance(locator, dict) else {},
+        "parser_version": getattr(atom, "parser_version", "") or "",
+    }
+
+
+def _upload_atoms(
+    blob_service: BlobServiceClient,
+    deal_id: str,
+    compile_id: str,
+    result: Any,
+    elapsed_sec: float,
+) -> str:
+    """Write the raw parser-os atom list (plus per-stage timings + counts)
+    to a side-channel blob the UI can read directly.
+
+    Path: deals/<deal_id>/parser-os/latest/atoms.json
+    """
+    from collections import Counter
+
+    atoms_list = list(getattr(result, "atoms", []) or [])
+    serialized = [_serialize_atom_for_ui(a) for a in atoms_list]
+
+    # Per-doc atom counts + per-type counts (lets the UI render the chip
+    # cloud + Files table without computing across the full list).
+    by_artifact: dict[str, dict[str, Any]] = {}
+    type_counter: Counter = Counter()
+    for a in serialized:
+        type_counter[a["atom_type"]] += 1
+        src = a.get("source_filename") or "(unknown)"
+        slot = by_artifact.setdefault(src, {"atom_count": 0, "by_type": Counter()})
+        slot["atom_count"] += 1
+        slot["by_type"][a["atom_type"]] += 1
+    by_artifact_out = {
+        fn: {"atom_count": v["atom_count"], "by_type": dict(v["by_type"])}
+        for fn, v in by_artifact.items()
+    }
+
+    # Stage timings from trace (if available on the result)
+    stages: list[dict[str, Any]] = []
+    try:
+        trace = getattr(result, "trace", None) or {}
+        if isinstance(trace, dict):
+            evts = trace.get("stages") or trace.get("events") or []
+            for e in evts:
+                if isinstance(e, dict):
+                    stages.append({
+                        "stage": e.get("stage"),
+                        "duration_ms": e.get("duration_ms"),
+                        "counts": e.get("counts") or {},
+                        "warning_count": e.get("warning_count", 0),
+                        "error_count": e.get("error_count", 0),
+                    })
+    except Exception:
+        pass
+
+    payload = {
+        "schema": "parser_os.atoms.v1",
+        "compile_id": compile_id,
+        "deal_id": deal_id,
+        "generated_at_utc": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        "elapsed_sec": round(elapsed_sec, 2),
+        "counts": {
+            "atoms": len(serialized),
+            "entities": len(getattr(result, "entities", []) or []),
+            "edges": len(getattr(result, "edges", []) or []),
+            "packets": len(getattr(result, "packets", []) or []),
+            "by_atom_type": dict(type_counter),
+        },
+        "by_artifact": by_artifact_out,
+        "stages": stages,
+        "atoms": serialized,
+    }
+
+    path = f"deals/{deal_id}/parser-os/latest/atoms.json"
+    client = blob_service.get_blob_client(container=BLOB_CONTAINER, blob=path)
+    client.upload_blob(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+        overwrite=True,
+        content_type="application/json",
+    )
+    return path
+
+
 # ─── The actual compile ───────────────────────────────────────────────────
 
 
@@ -401,8 +553,25 @@ def _do_compile(
         except Exception as exc:
             log.warning("compile-trace upload failed: %s", exc)
 
+        # 5e. v56: ALSO upload raw atoms.json side-channel for the UI
+        # to read directly (bypasses the OrbitBrief envelope projection
+        # which overlays fixture data on site_registry). One source of
+        # truth for Template D — every field the deal-artifacts page
+        # needs without depending on the OrbitBrief brief-gen pipeline.
+        try:
+            atoms_path = _upload_atoms(
+                blob_service, job.deal_id, job.compile_id, result, elapsed
+            )
+            log.info("Uploaded atoms to %s", atoms_path)
+        except Exception as atoms_exc:
+            # Never let atoms.json write failure kill the compile —
+            # envelope.json already uploaded above is the contract.
+            log.warning("Failed to write atoms.json side-channel: %s", atoms_exc)
+            atoms_path = None
+
         return {
             "envelope_path": env_path,
+            "atoms_path": atoms_path,
             "entity_count": len(result.entities),
             "atom_count": len(result.atoms),
             "elapsed_sec": elapsed,
