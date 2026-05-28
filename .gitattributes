@@ -1,0 +1,5 @@
+# Force LF line endings for shell scripts so Docker builds don't bake CRLF
+# into the entrypoint and crash with "bash\r: No such file or directory".
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.py text eol=lf
