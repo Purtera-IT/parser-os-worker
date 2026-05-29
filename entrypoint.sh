@@ -37,18 +37,31 @@ if [[ -z "${TS_AUTHKEY:-}" ]]; then
   exec "$@"
 fi
 
+# v57.3.2: each Container App Job invocation is short-lived (≤30 min for
+# a full parser-os compile). Without --ephemeral, every invocation
+# registers a permanent Tailscale node — after a few hundred runs we hit
+# the tailnet's node quota and new workers fail with "node quota reached
+# on this tailnet". --ephemeral marks the node as auto-expiring: when
+# tailscaled exits at job-end, the controlplane cleans up the node
+# entry automatically (no admin cleanup required). Also unique hostname
+# per invocation so concurrent workers don't fight for the same node
+# slot (hostname collisions force-replace the previous node).
+_UNIQUE_HOST="${TAILSCALE_HOSTNAME:-parser-os-worker}-$(hostname 2>/dev/null || echo unknown)-$(date +%s)"
+
 if [[ -n "${TAILSCALE_UP_EXTRA_ARGS:-}" ]]; then
   # shellcheck disable=SC2086
   tailscale --socket=/tmp/tailscaled.sock up \
     --authkey="${TS_AUTHKEY}" \
-    --hostname="${TAILSCALE_HOSTNAME:-parser-os-worker-azure}" \
+    --hostname="${_UNIQUE_HOST}" \
     --accept-dns="${TS_ACCEPT_DNS:-false}" \
+    --ephemeral \
     ${TAILSCALE_UP_EXTRA_ARGS}
 else
   tailscale --socket=/tmp/tailscaled.sock up \
     --authkey="${TS_AUTHKEY}" \
-    --hostname="${TAILSCALE_HOSTNAME:-parser-os-worker-azure}" \
-    --accept-dns="${TS_ACCEPT_DNS:-false}"
+    --hostname="${_UNIQUE_HOST}" \
+    --accept-dns="${TS_ACCEPT_DNS:-false}" \
+    --ephemeral
 fi
 
 # urllib reads HTTP_PROXY / HTTPS_PROXY for forward + CONNECT proxying.
