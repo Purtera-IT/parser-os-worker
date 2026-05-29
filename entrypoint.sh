@@ -37,15 +37,15 @@ if [[ -z "${TS_AUTHKEY:-}" ]]; then
   exec "$@"
 fi
 
-# v57.3.2: each Container App Job invocation is short-lived (≤30 min for
-# a full parser-os compile). Without --ephemeral, every invocation
-# registers a permanent Tailscale node — after a few hundred runs we hit
-# the tailnet's node quota and new workers fail with "node quota reached
-# on this tailnet". --ephemeral marks the node as auto-expiring: when
-# tailscaled exits at job-end, the controlplane cleans up the node
-# entry automatically (no admin cleanup required). Also unique hostname
-# per invocation so concurrent workers don't fight for the same node
-# slot (hostname collisions force-replace the previous node).
+# v57.3.3: --ephemeral is a server-side property of the auth key, not a
+# CLI flag here — Tailscale 1.98+ rejects it on ``tailscale up`` and
+# dumps USAGE help instead of registering, causing every job to fail.
+# The ephemeral property must be set when the AUTH KEY is generated in
+# the Tailscale admin console (https://login.tailscale.com/admin/settings/keys
+# → Generate auth key → check Ephemeral box). Each new node registered
+# with that key inherits the ephemeral status and auto-expires when
+# tailscaled exits. Keep the unique hostname per invocation so
+# concurrent workers don't collide on the same node slot.
 _UNIQUE_HOST="${TAILSCALE_HOSTNAME:-parser-os-worker}-$(hostname 2>/dev/null || echo unknown)-$(date +%s)"
 
 if [[ -n "${TAILSCALE_UP_EXTRA_ARGS:-}" ]]; then
@@ -54,14 +54,12 @@ if [[ -n "${TAILSCALE_UP_EXTRA_ARGS:-}" ]]; then
     --authkey="${TS_AUTHKEY}" \
     --hostname="${_UNIQUE_HOST}" \
     --accept-dns="${TS_ACCEPT_DNS:-false}" \
-    --ephemeral \
     ${TAILSCALE_UP_EXTRA_ARGS}
 else
   tailscale --socket=/tmp/tailscaled.sock up \
     --authkey="${TS_AUTHKEY}" \
     --hostname="${_UNIQUE_HOST}" \
-    --accept-dns="${TS_ACCEPT_DNS:-false}" \
-    --ephemeral
+    --accept-dns="${TS_ACCEPT_DNS:-false}"
 fi
 
 # urllib reads HTTP_PROXY / HTTPS_PROXY for forward + CONNECT proxying.
