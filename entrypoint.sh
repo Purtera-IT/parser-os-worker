@@ -46,7 +46,12 @@ fi
 # with that key inherits the ephemeral status and auto-expires when
 # tailscaled exits. Keep the unique hostname per invocation so
 # concurrent workers don't collide on the same node slot.
-_UNIQUE_HOST="${TAILSCALE_HOSTNAME:-parser-os-worker}-$(hostname 2>/dev/null || echo unknown)-$(date +%s)"
+# v57.3.4: hostname max length is 63 bytes in Tailscale. The container's
+# own hostname is already ~32 chars (parser-os-worker-dev-eus2-XXXXX-YYYYY),
+# and prepending the env-var prefix + appending epoch pushed previous
+# attempts to 70+ chars. Use a short prefix + last 8 of epoch only —
+# well under 63 chars, still unique enough for concurrent runs.
+_UNIQUE_HOST="parser-os-worker-$(date +%s | tail -c 9)"
 
 if [[ -n "${TAILSCALE_UP_EXTRA_ARGS:-}" ]]; then
   # shellcheck disable=SC2086
