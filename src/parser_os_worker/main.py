@@ -69,12 +69,20 @@ def _iso_now() -> str:
 
 def _blob_path_from_url(blob_url: str) -> tuple[str, str]:
     """Parse 'https://<acct>.blob.core.windows.net/<container>/<path>' →
-    (container, path)."""
+    (container, path).
+
+    v57.6 fix: URL-decode the path so blob keys containing spaces, parens,
+    and other percent-encoded chars (``SC%20AP%20pSOW%20(4.27.26).docx`` →
+    ``SC AP pSOW (4.27.26).docx``) are looked up correctly. Without the
+    decode every artifact whose filename has a space → BlobNotFound at
+    download time.
+    """
+    from urllib.parse import unquote
     p = urlparse(blob_url)
     parts = p.path.lstrip("/").split("/", 1)
     if len(parts) != 2:
         raise ValueError(f"Cannot parse blob url: {blob_url}")
-    return parts[0], parts[1]
+    return unquote(parts[0]), unquote(parts[1])
 
 
 @dataclass
