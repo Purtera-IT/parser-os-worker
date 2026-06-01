@@ -66,6 +66,15 @@ jobs:
           path: parser-os-service
           token: ${{ secrets.GH_REPO_TOKEN }}
 
+      - name: Checkout SowSmith
+        # Dockerfile's `COPY SowSmith ./SowSmith` needs the repo present in build context.
+        uses: actions/checkout@v4
+        with:
+          repository: Purtera-IT/SowSmith
+          ref: main
+          path: SowSmith
+          token: ${{ secrets.GH_REPO_TOKEN }}
+
       - name: Capture parser-os SHA
         id: pos
         run: |
