@@ -108,6 +108,7 @@ RUN echo "$GIT_SHA" > /app/.git_sha \
 # urllib (used by parser-os LLM clients) routes through the local
 # tailscaled HTTP-CONNECT proxy, then execs the worker.
 COPY parser-os-worker/entrypoint.sh /entrypoint.sh
+COPY parser-os-worker/fetch_ml.py /fetch_ml.py
 RUN chmod +x /entrypoint.sh
 
 # Don't set HTTP_PROXY here: tailscaled must reach controlplane before

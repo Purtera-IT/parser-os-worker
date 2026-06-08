@@ -87,4 +87,8 @@ export no_proxy="$NO_PROXY"
 # proxy URL.
 export OLLAMA_HOST="${OLLAMA_HOST_TAILSCALE:-http://100.114.102.122:11434}"
 
+# Fetch ML deflector artifacts (non-fatal) so the #70/#71 heads + kNN
+# store fire live; missing -> deflectors abstain -> LLM-only path.
+python /fetch_ml.py || echo "fetch_ml skipped" >&2
+
 exec "$@"
