@@ -809,6 +809,30 @@ def main() -> int:
 
         queue_client.delete_message(msg)
         log.info("Job complete: compile_id=%s", job.compile_id)
+
+        # Cross-run learning (fully non-fatal, AFTER the result is delivered):
+        # the compile just appended new teacher rows (+ any PM corrections) to
+        # the persisted training log. Retrain the eval-gated deflector heads on
+        # the grown log (no-op until the log grows past the staleness gate) and
+        # persist the log + retrained heads back to blob so the NEXT run loads
+        # improved heads. This is what makes the dev deflectors learn live.
+        try:
+            from app.core.type_head import retrain_if_stale
+            retrain_if_stale()
+        except Exception as exc:
+            log.warning("type-head retrain skipped: %s", exc)
+        try:
+            from app.core.span_extractor import retrain_span_heads
+            retrain_span_heads()
+        except Exception as exc:
+            log.warning("span-head retrain skipped: %s", exc)
+        try:
+            import subprocess
+            import sys as _sys
+            subprocess.run([_sys.executable, "/write_back_ml.py"], timeout=180, check=False)
+        except Exception as exc:
+            log.warning("ml write-back skipped: %s", exc)
+
         return 0
 
     except Exception as exc:

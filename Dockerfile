@@ -109,6 +109,7 @@ RUN echo "$GIT_SHA" > /app/.git_sha \
 # tailscaled HTTP-CONNECT proxy, then execs the worker.
 COPY parser-os-worker/entrypoint.sh /entrypoint.sh
 COPY parser-os-worker/fetch_ml.py /fetch_ml.py
+COPY parser-os-worker/write_back_ml.py /write_back_ml.py
 RUN chmod +x /entrypoint.sh
 
 # Don't set HTTP_PROXY here: tailscaled must reach controlplane before
