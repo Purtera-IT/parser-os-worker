@@ -38,6 +38,10 @@ BLOB_CONTAINER = os.environ.get("AZURE_STORAGE_BLOB_CONTAINER", "orbitbrief-arti
 COMPILE_TIMEOUT_SEC = int(os.environ.get("COMPILE_TIMEOUT_SEC", "1500"))  # 25 min hard
 VISIBILITY_TIMEOUT_SEC = int(os.environ.get("MESSAGE_VISIBILITY_TIMEOUT_SEC", "1800"))  # 30 min
 MAX_DEQUEUE_COUNT = int(os.environ.get("MAX_DEQUEUE_COUNT", "3"))  # poison after 3 retries
+# Dev skip-list: deal_ids this worker ack-and-drops without compiling. Used to keep
+# a giant deal (e.g. a 20k-atom deal that monopolizes the single LLM) off the dev
+# worker so interactive reparses always get the slot. Comma-separated; reversible.
+SKIP_DEAL_IDS = {d.strip() for d in os.environ.get("SOWSMITH_WORKER_SKIP_DEALS", "").split(",") if d.strip()}
 WORKER_SHA = os.environ.get("PARSER_OS_WORKER_SHA", "unknown")
 PARSER_OS_SHA = os.environ.get("PARSER_OS_SHA", "unknown")
 # v45.2: queue to notify brief-gen worker that a fresh envelope is ready.
@@ -777,6 +781,15 @@ def main() -> int:
         )
         queue_client.delete_message(msg)
         return 2
+
+    # Dev skip-list: ack-and-drop deals we deliberately don't run on this worker
+    # (a giant deal hogging the single LLM in dev → interactive reparses starve).
+    # Reversible via SOWSMITH_WORKER_SKIP_DEALS. Universal mechanism (env-driven id
+    # list), not parser logic.
+    if job.deal_id in SKIP_DEAL_IDS:
+        log.warning("deal_id %s in SOWSMITH_WORKER_SKIP_DEALS — acking without compiling", job.deal_id)
+        queue_client.delete_message(msg)
+        return 0
 
     # Mark running
     _write_status(blob_service, job, "running", stage="starting", percent_complete=0)
