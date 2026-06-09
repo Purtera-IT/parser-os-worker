@@ -42,6 +42,9 @@ MAX_DEQUEUE_COUNT = int(os.environ.get("MAX_DEQUEUE_COUNT", "3"))  # poison afte
 # a giant deal (e.g. a 20k-atom deal that monopolizes the single LLM) off the dev
 # worker so interactive reparses always get the slot. Comma-separated; reversible.
 SKIP_DEAL_IDS = {d.strip() for d in os.environ.get("SOWSMITH_WORKER_SKIP_DEALS", "").split(",") if d.strip()}
+# Post-compile cross-run retrain holds the slot (embeds via Ollama; can hang under
+# contention). Default ON; set 0 in dev so executions free the slot immediately.
+RETRAIN_ENABLED = os.environ.get("SOWSMITH_WORKER_RETRAIN", "1").strip().lower() not in ("0", "false", "no")
 WORKER_SHA = os.environ.get("PARSER_OS_WORKER_SHA", "unknown")
 PARSER_OS_SHA = os.environ.get("PARSER_OS_SHA", "unknown")
 # v45.2: queue to notify brief-gen worker that a fresh envelope is ready.
@@ -829,34 +832,54 @@ def main() -> int:
         # the grown log (no-op until the log grows past the staleness gate) and
         # persist the log + retrained heads back to blob so the NEXT run loads
         # improved heads. This is what makes the dev deflectors learn live.
-        try:
-            from app.core.type_head import retrain_if_stale
-            retrain_if_stale()
-        except Exception as exc:
-            log.warning("type-head retrain skipped: %s", exc)
-        try:
-            from app.core.span_extractor import retrain_span_heads
-            retrain_span_heads()
-        except Exception as exc:
-            log.warning("span-head retrain skipped: %s", exc)
-        try:
-            import subprocess
-            import sys as _sys
-            subprocess.run([_sys.executable, "/write_back_ml.py"], timeout=180, check=False)
-        except Exception as exc:
-            log.warning("ml write-back skipped: %s", exc)
+        # Gated: the retrain embeds the log via Ollama, which under LLM contention
+        # can HANG and hold the worker slot for many minutes (starving the next
+        # reparse). OFF in dev (SOWSMITH_WORKER_RETRAIN=0) so the execution returns
+        # the instant the result is delivered → the slot frees immediately.
+        if RETRAIN_ENABLED:
+            try:
+                from app.core.type_head import retrain_if_stale
+                retrain_if_stale()
+            except Exception as exc:
+                log.warning("type-head retrain skipped: %s", exc)
+            try:
+                from app.core.span_extractor import retrain_span_heads
+                retrain_span_heads()
+            except Exception as exc:
+                log.warning("span-head retrain skipped: %s", exc)
+            try:
+                import subprocess
+                import sys as _sys
+                subprocess.run([_sys.executable, "/write_back_ml.py"], timeout=180, check=False)
+            except Exception as exc:
+                log.warning("ml write-back skipped: %s", exc)
 
         return 0
 
     except Exception as exc:
         log.exception("Compile failed: %s", exc)
+        # Permanent failure (dead deal: manifest/artifact blob deleted) → DROP the
+        # message immediately. Otherwise it cycles every visibility_timeout (30min)
+        # x MAX_DEQUEUE, clogging the single-slot queue for ~90min and starving
+        # interactive reparses (the dev "zombie storm"). Transient failures still
+        # retry.
+        msg_l = f"{type(exc).__name__}: {exc}".lower()
+        permanent = ("notfound" in type(exc).__name__.lower() or "blobnotfound" in msg_l
+                     or "resourcenotfound" in msg_l or "the specified blob does not exist" in msg_l)
         _write_status(
             blob_service, job, "failed",
-            stage="exception",
+            stage=("dead_deal" if permanent else "exception"),
             error=f"{type(exc).__name__}: {exc}",
             traceback=traceback.format_exc()[:4000],
         )
-        # Don't delete the message — it'll reappear after visibility_timeout for retry
+        if permanent:
+            log.error("Permanent failure (dead deal / missing blob) — dropping message to break the zombie cycle")
+            try:
+                queue_client.delete_message(msg)
+            except Exception:
+                pass
+            return 2
+        # transient → leave for retry
         return 1
 
 
