@@ -884,4 +884,19 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # WORKER_LOOP=1 → warm persistent poller (Container App, minReplicas=1). The pod
+    # stays alive polling the queue, so fetch_ml + the bge gate/span torch models load
+    # ONCE at startup and stay hot in-process across messages — every reparse is
+    # picked up instantly with zero cold-start. Default (unset) = one-shot Job mode.
+    if os.environ.get("WORKER_LOOP", "").strip().lower() in ("1", "true", "yes", "on"):
+        import time as _time
+        _sleep = int(os.environ.get("WORKER_LOOP_SLEEP_SEC", "3"))
+        log.info("WORKER_LOOP mode — warm persistent poller (sleep=%ss between polls)", _sleep)
+        while True:
+            try:
+                main()
+            except Exception as exc:  # never let one bad message kill the warm pod
+                log.exception("loop iteration error: %s", exc)
+            _time.sleep(_sleep)
+    else:
+        sys.exit(main())
