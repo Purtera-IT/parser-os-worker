@@ -82,7 +82,12 @@ RUN set -eux; \
       "PyMuPDF>=1.24" \
       "opencv-python-headless>=4.9" \
       "Pillow>=10.0" \
-      "pypdfium2>=4.30"; \
+      "pypdfium2>=4.30" \
+      "transformers>=4.44"; \
+    # CPU-only torch for the B rubric-gate + C span taggers (bge models are tiny;
+    # bge uses WordPiece so no sentencepiece/protobuf needed). The runtime loaders
+    # abstain if absent, so this only enables the deflectors — never breaks.
+    pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu; \
     pip install --no-cache-dir ./SowSmith; \
     pip install --no-cache-dir --no-deps ./parser-os-worker; \
     rm -rf /build
