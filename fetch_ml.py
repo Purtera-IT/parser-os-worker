@@ -20,6 +20,28 @@ try:
             f.write(cc.download_blob(b.name).readall())
         n += 1
     print(f"fetch_ml: downloaded {n} artifact files -> {DST}")
+    # Unpack the fine-tuned model tarballs to the dirs the runtime loaders expect:
+    #   gate_rubric_best.tgz (best/)           -> {DST}/_gate_rubric/best
+    #   span_heads_gpu.tgz (runs/span_*/best)  -> {DST}/_span_gpu/runs/span_*/best
+    # Set on the worker: SOWSMITH_RUBRIC_GATE_DIR={DST}/_gate_rubric/best ,
+    #   SOWSMITH_SPAN_GPU_DIR={DST}/_span_gpu/runs . Non-fatal.
+    import tarfile
+    for name, sub in (("gate_rubric_best.tgz", "_gate_rubric"),
+                      ("span_heads_gpu.tgz", "_span_gpu")):
+        tp = os.path.join(DST, name)
+        if not os.path.exists(tp):
+            continue
+        outd = os.path.join(DST, sub)
+        os.makedirs(outd, exist_ok=True)
+        try:
+            with tarfile.open(tp) as tf:
+                try:
+                    tf.extractall(outd, filter="data")   # py>=3.12 safe extraction
+                except TypeError:
+                    tf.extractall(outd)
+            print(f"fetch_ml: extracted {name} -> {outd}")
+        except Exception as ex:
+            print(f"fetch_ml: extract {name} failed ({ex})", file=sys.stderr)
 except Exception as e:
     print(f"fetch_ml: skipped ({type(e).__name__}: {e})", file=sys.stderr)
     sys.exit(0)
