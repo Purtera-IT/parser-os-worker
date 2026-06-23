@@ -125,6 +125,17 @@ jobs:
             --resource-group ${{ env.JOB_RG }} \
             --image "${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.img.outputs.digest }}"
 
+      - name: Roll the WARM worker Container App (the real queue consumer)
+        run: |
+          # parser-os-worker-warm is a long-running Container App that consumes the
+          # compile queue and grabs each message before the cold-start Job. It was
+          # NEVER updated by deploys -> it silently ran stale code. Roll it to the
+          # same digest every deploy. `--image` preserves its env vars + CPU/memory.
+          az containerapp update \
+            --name parser-os-worker-warm \
+            --resource-group ${{ env.JOB_RG }} \
+            --image "${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.img.outputs.digest }}"
+
       - name: Verify the rolled image stamps the expected parser-os SHA
         run: |
           # Run the image once (no queue message -> it just prints its baked SHAs
