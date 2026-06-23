@@ -39,6 +39,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -u 10001 parserosworker
 WORKDIR /build
 
+# Cache-bust: a per-build changing value (the git SHA) forces the app COPY +
+# installs below to rebuild EVERY commit, so updated parser-os / worker code is
+# never served from a stale cached ACR layer (the bug that pinned old heads).
+# The heavy base layers above (apt + tailscale) stay cached.
+ARG CACHEBUST=unknown
+RUN echo "cachebust=$CACHEBUST"
+
 # Copy parser-os and parser-os-service (worker reuses projector) as siblings.
 # SowSmith — separate library, copied as local source so we don't depend on
 # git clone at build time (ACR build agent isn't reliably outbound for git).

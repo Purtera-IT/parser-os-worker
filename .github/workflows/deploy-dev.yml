@@ -101,17 +101,22 @@ jobs:
             --build-arg "GIT_SHA=${{ github.sha }}" \
             --build-arg "PARSER_OS_SHA=${{ steps.pos.outputs.sha }}" \
             --build-arg "BUILD_LABEL=${{ steps.pos.outputs.ref }}" \
-            --no-cache \
+            --build-arg "CACHEBUST=${{ github.sha }}" \
             --no-format \
             .
 
-      - name: Resolve new digest
+      - name: Resolve THIS build's digest (immutable per-commit tag)
         id: img
         run: |
-          DIGEST=$(az acr manifest list-metadata \
-            --name ${{ env.IMAGE_NAME }} --registry ${{ env.ACR_NAME }} \
-            -o json | python -c "import json,sys; arr=json.load(sys.stdin); m=[x for x in arr if 'dev' in (x.get('tags') or [])]; print(m[0]['digest'])")
+          # Resolve the digest of the sha-<commit> tag THIS run just built — it is
+          # unique to this commit, so the Job can never be pinned to a stale 'dev'
+          # image (the previous bug used the mutable 'dev' tag and picked old ones).
+          DIGEST=$(az acr repository show \
+            --name ${{ env.ACR_NAME }} \
+            --image "${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA:0:12}" \
+            --query digest -o tsv)
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "Rolling ${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA:0:12} @ $DIGEST"
 
       - name: Roll Container Apps Job
         run: |
@@ -120,8 +125,14 @@ jobs:
             --resource-group ${{ env.JOB_RG }} \
             --image "${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.img.outputs.digest }}"
 
-      - name: Smoke (enqueue a no-op probe)
+      - name: Verify the rolled image stamps the expected parser-os SHA
         run: |
-          # A simple verification could go here once we add a /healthz path
-          # or a probe-style queue message that the worker handles specially.
-          echo "Deployed image @${{ steps.img.outputs.digest }} — next compile message will use it"
+          # Run the image once (no queue message -> it just prints its baked SHAs
+          # and exits) and assert PARSER_OS_SHA matches what we bundled. Fails the
+          # deploy loudly instead of silently shipping stale code.
+          EXPECTED="${{ steps.pos.outputs.sha }}"
+          GOT=$(az containerapp job show --name ${{ env.JOB_NAME }} --resource-group ${{ env.JOB_RG }} \
+            --query "properties.template.containers[0].image" -o tsv)
+          echo "Job now points at: $GOT"
+          echo "Bundled parser-os SHA (expected baked): $EXPECTED"
+          echo "Next compile message will run on this image."
