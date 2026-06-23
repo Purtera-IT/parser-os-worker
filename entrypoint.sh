@@ -16,6 +16,11 @@ set -euo pipefail
 # tailscaled must reach controlplane without any proxy env interfering.
 unset ALL_PROXY all_proxy HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 
+# Fetch + unpack the ML head artifacts (gate/facet/type) to ML_ARTIFACT_DIR.
+# Runs BEFORE the proxy is set so blob traffic reaches Azure directly. Best-effort:
+# on any failure the heads abstain and the compile runs LLM-only (byte-identical).
+python -m parser_os_worker.fetch_ml || echo "[entrypoint] fetch_ml failed; heads will abstain" >&2
+
 mkdir -p "${TS_STATE_DIR:-/var/lib/tailscale}"
 
 tailscaled --tun=userspace-networking \

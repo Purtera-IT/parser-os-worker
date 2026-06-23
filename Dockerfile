@@ -83,6 +83,12 @@ RUN set -eux; \
       "opencv-python-headless>=4.9" \
       "Pillow>=10.0" \
       "pypdfium2>=4.30"; \
+    # ML head serving: gate/facet (sentence-transformers kNN) + GPU type head
+    # (HF transformer). CPU-only torch (no GPU on the Container App) keeps the
+    # image lean (~200MB vs ~2GB CUDA). sentence-transformers>=5.6 is REQUIRED —
+    # the encoders were saved with 5.6 and silently fail to embed on older ST.
+    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch; \
+    pip install --no-cache-dir "transformers>=4.44" "sentence-transformers>=5.6"; \
     pip install --no-cache-dir ./SowSmith; \
     pip install --no-cache-dir --no-deps ./parser-os-worker; \
     rm -rf /build
@@ -120,6 +126,22 @@ ENV TS_STATE_DIR=/var/lib/tailscale \
 # USER parserosworker  # disabled for tailscaled state writes
 
 ENV PYTHONUNBUFFERED=1
+
+# ─── ML head serving (gate / facet / type) ────────────────────────────────
+# entrypoint.sh runs fetch_ml.py, which unpacks the head tarballs from blob
+# ml-artifacts into ML_ARTIFACT_DIR; the parser-os loaders read the dirs below.
+# Every head is guess-free + safe-off: if an artifact is missing the head
+# abstains and the compile runs LLM-only (byte-identical). HF_HUB_OFFLINE so the
+# encoders never phone home (models are local; the worker has no general egress).
+ENV ML_ARTIFACT_DIR=/tmp/ml \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    SOWSMITH_CONTRASTIVE_TYPE=1 \
+    SOWSMITH_CONTRASTIVE_TYPE_DIR=/tmp/ml/_contrastive_type \
+    SOWSMITH_FACET_SECTIONS=1 \
+    SOWSMITH_CONTRASTIVE_FACET_DIR=/tmp/ml/_contrastive_facet \
+    SOWSMITH_TYPE_HEAD_GPU=1 \
+    SOWSMITH_TYPE_HEAD_GPU_DIR=/tmp/ml/_type_head_gpu/best
 
 # Entrypoint joins tailnet, then exec the worker.
 ENTRYPOINT ["/entrypoint.sh"]
