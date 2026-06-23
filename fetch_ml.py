@@ -42,6 +42,25 @@ try:
             print(f"fetch_ml: extracted {name} -> {outd}")
         except Exception as ex:
             print(f"fetch_ml: extract {name} failed ({ex})", file=sys.stderr)
+    # Clean-rubric heads (2026-06): contrastive gate + facet kNN stores and the
+    # GPU type head. These tarballs have the marker dir as their ROOT
+    # (_contrastive_type/, _contrastive_facet/, _type_head_gpu/) so extract to DST.
+    # Loaders read: SOWSMITH_CONTRASTIVE_TYPE_DIR={DST}/_contrastive_type ,
+    #   SOWSMITH_CONTRASTIVE_FACET_DIR={DST}/_contrastive_facet ,
+    #   SOWSMITH_TYPE_HEAD_GPU_DIR={DST}/_type_head_gpu/best . Non-fatal.
+    for name in ("contrastive_type.tgz", "contrastive_facet.tgz", "type_head_gpu.tgz"):
+        tp = os.path.join(DST, name)
+        if not os.path.exists(tp):
+            continue
+        try:
+            with tarfile.open(tp) as tf:
+                try:
+                    tf.extractall(DST, filter="data")   # py>=3.12 safe extraction
+                except TypeError:
+                    tf.extractall(DST)
+            print(f"fetch_ml: extracted {name} -> {DST}")
+        except Exception as ex:
+            print(f"fetch_ml: extract {name} failed ({ex})", file=sys.stderr)
 except Exception as e:
     print(f"fetch_ml: skipped ({type(e).__name__}: {e})", file=sys.stderr)
     sys.exit(0)
