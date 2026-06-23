@@ -101,6 +101,7 @@ jobs:
             --build-arg "GIT_SHA=${{ github.sha }}" \
             --build-arg "PARSER_OS_SHA=${{ steps.pos.outputs.sha }}" \
             --build-arg "BUILD_LABEL=${{ steps.pos.outputs.ref }}" \
+            --no-cache \
             --no-format \
             .
 
