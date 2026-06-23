@@ -202,6 +202,43 @@ def _enqueue_brief_gen(
     )
 
 
+def _trigger_brief_gen_http(job: "JobMessage") -> None:
+    """Kick brief-gen (PM_HANDOFF etc.) on orbitbrief-core-worker right after the
+    parse, so the OrbitBrief page is fresh on EVERY run.
+
+    The intended queue path (parser-os-orbitbrief-jobs -> Function App -> Postgres
+    -> timer -> orbitbrief-core-worker) is not deployed, so this direct HTTP call
+    is the live auto-trigger. Best-effort: any failure just leaves the brief stale;
+    it never fails the compile.
+
+    NOTE: the worker routes HTTP through the Tailscale proxy (for Ollama), but
+    orbitbrief-core-worker is a public Azure ingress URL — so we use an opener with
+    an EMPTY ProxyHandler to connect DIRECT, bypassing the proxy.
+    """
+    base = os.environ.get("ORBITBRIEF_CORE_WORKER_URL", "").strip()
+    if not base:
+        log.info("ORBITBRIEF_CORE_WORKER_URL unset; skipping brief-gen trigger.")
+        return
+    import urllib.request
+    import uuid
+    bearer = os.environ.get("ORBITBRIEF_CORE_WORKER_BEARER", "").strip()
+    run_id = uuid.uuid4().hex
+    payload = json.dumps(
+        {"deal_id": job.deal_id, "run_id": run_id, "mirror_latest": True}
+    ).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    req = urllib.request.Request(
+        f"{base.rstrip('/')}/v1/compile-run?async=1",
+        data=payload, method="POST", headers=headers,
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # direct, no proxy
+    with opener.open(req, timeout=15) as resp:
+        log.info("Brief-gen triggered (HTTP %s) deal=%s run=%s",
+                 getattr(resp, "status", "?"), job.deal_id, run_id)
+
+
 # v56: Side-channel atoms.json with the raw parser-os atom list — bypasses
 # the OrbitBrief envelope projection (which overlays fixture data on the
 # site_registry field). This is what the Deal Artifacts UI page reads so
@@ -820,6 +857,16 @@ def main() -> int:
         except Exception as exc:
             log.warning(
                 "Brief-gen enqueue failed for deal=%s compile=%s: %s",
+                job.deal_id, job.compile_id, exc,
+            )
+        # The queue consumer above isn't deployed, so ALSO trigger brief-gen
+        # directly over HTTP — this is the live auto-trigger that keeps OrbitBrief
+        # fresh after every parse. Best-effort; never fails the compile.
+        try:
+            _trigger_brief_gen_http(job)
+        except Exception as exc:
+            log.warning(
+                "Brief-gen HTTP trigger failed for deal=%s compile=%s: %s",
                 job.deal_id, job.compile_id, exc,
             )
 
