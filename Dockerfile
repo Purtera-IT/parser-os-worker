@@ -88,6 +88,9 @@ RUN set -eux; \
     # bge uses WordPiece so no sentencepiece/protobuf needed). The runtime loaders
     # abstain if absent, so this only enables the deflectors — never breaks.
     pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu; \
+    # sentence-transformers>=5.6 for the contrastive gate + facet kNN heads — the
+    # encoders were saved with ST 5.6 and silently fail to embed on older versions.
+    pip install --no-cache-dir "sentence-transformers>=5.6"; \
     pip install --no-cache-dir ./SowSmith; \
     pip install --no-cache-dir --no-deps ./parser-os-worker; \
     rm -rf /build
