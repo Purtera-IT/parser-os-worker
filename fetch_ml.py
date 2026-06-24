@@ -12,14 +12,31 @@ try:
     from azure.storage.blob import ContainerClient
     cc = ContainerClient.from_connection_string(conn, "ml-artifacts")
     os.makedirs(DST, exist_ok=True)
-    n = 0
+    # ml-artifacts is a shared dumping ground (training DBs, YOLO dataset images,
+    # zip packages — GBs / 730+ blobs). The worker only needs the head tarballs +
+    # the small pkl/json registries. Downloading everything pushed cold-start boot
+    # past the queue's message-visibility timeout -> the compile message gets
+    # consumed by a still-booting Job and lost (a queue zombie). Skip the junk so
+    # boot stays ~1 min.
+    def _skip(name: str) -> bool:
+        low = name.lower()
+        if low.startswith("dataset/") or low.endswith((".png", ".jpg", ".jpeg", ".zip")):
+            return True
+        if "_training_" in low or "_runpod_" in low or "_backup_" in low:
+            return True
+        return False
+
+    n = skipped = 0
     for b in cc.list_blobs():
+        if _skip(b.name):
+            skipped += 1
+            continue
         p = os.path.join(DST, b.name)
         os.makedirs(os.path.dirname(p) or DST, exist_ok=True)
         with open(p, "wb") as f:
             f.write(cc.download_blob(b.name).readall())
         n += 1
-    print(f"fetch_ml: downloaded {n} artifact files -> {DST}")
+    print(f"fetch_ml: downloaded {n} artifact files ({skipped} junk skipped) -> {DST}")
     # Unpack the fine-tuned model tarballs to the dirs the runtime loaders expect:
     #   gate_rubric_best.tgz (best/)           -> {DST}/_gate_rubric/best
     #   span_heads_gpu.tgz (runs/span_*/best)  -> {DST}/_span_gpu/runs/span_*/best
