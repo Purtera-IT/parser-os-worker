@@ -34,6 +34,13 @@ from azure.storage.queue import QueueServiceClient, TextBase64EncodePolicy
 
 ACCOUNT_NAME = os.environ.get("AZURE_STORAGE_ACCOUNT", "purpulsedevstg01")
 QUEUE_NAME = os.environ.get("AZURE_STORAGE_QUEUE", "parser-os-compile-jobs")
+# v59: interactive re-parses (UI Re-parse button → Function App → /v1/compile/async,
+# which defaults priority=true) land on this PRIORITY queue. The worker drains it
+# BEFORE the normal queue so a user's click never waits behind a bulk/batch backlog
+# (the "40 deals queued, my reparse hangs" problem). Bulk callers pass priority=false.
+PRIORITY_QUEUE_NAME = os.environ.get(
+    "AZURE_STORAGE_QUEUE_PRIORITY", "parser-os-compile-jobs-priority"
+)
 BLOB_CONTAINER = os.environ.get("AZURE_STORAGE_BLOB_CONTAINER", "orbitbrief-artifacts")
 COMPILE_TIMEOUT_SEC = int(os.environ.get("COMPILE_TIMEOUT_SEC", "1500"))  # 25 min hard
 VISIBILITY_TIMEOUT_SEC = int(os.environ.get("MESSAGE_VISIBILITY_TIMEOUT_SEC", "1800"))  # 30 min
@@ -807,23 +814,47 @@ def main() -> int:
             account_url=f"https://{ACCOUNT_NAME}.blob.core.windows.net",
             credential=cred,
         )
+    # v59: drain the PRIORITY queue (interactive re-parses) BEFORE the normal
+    # queue (bulk/batch). One message per process (Container Apps Jobs pattern).
+    # A user's UI click must never wait behind a bulk backlog — so we always check
+    # priority first and only fall through to the normal queue when it's empty.
+    # The priority check is best-effort: if the queue is missing/unreachable we
+    # silently use the normal queue (byte-identical to pre-v59 behavior).
     queue_client = queue_service.get_queue_client(QUEUE_NAME)
-
-    # Pull ONE message (Container Apps Jobs pattern: one process = one unit of work)
-    log.info("Dequeuing one message from %s ...", QUEUE_NAME)
-    messages = list(
-        queue_client.receive_messages(
-            visibility_timeout=VISIBILITY_TIMEOUT_SEC,
-            messages_per_page=1,
+    source_queue = QUEUE_NAME
+    messages: list = []
+    try:
+        priority_client = queue_service.get_queue_client(PRIORITY_QUEUE_NAME)
+        messages = list(
+            priority_client.receive_messages(
+                visibility_timeout=VISIBILITY_TIMEOUT_SEC,
+                messages_per_page=1,
+            )
         )
-    )
+        if messages:
+            queue_client = priority_client
+            source_queue = PRIORITY_QUEUE_NAME
+    except Exception as exc:
+        log.warning("Priority queue poll failed (%s); using normal queue.", exc)
 
     if not messages:
-        log.info("Queue empty; nothing to do.")
+        log.info("Dequeuing one message from %s ...", QUEUE_NAME)
+        messages = list(
+            queue_client.receive_messages(
+                visibility_timeout=VISIBILITY_TIMEOUT_SEC,
+                messages_per_page=1,
+            )
+        )
+
+    if not messages:
+        log.info("Both queues empty; nothing to do.")
         return 0
     msg = messages[0]
 
-    log.info("Got message (dequeue_count=%d, id=%s)", msg.dequeue_count, msg.id)
+    log.info(
+        "Got message from %s (dequeue_count=%d, id=%s)",
+        source_queue, msg.dequeue_count, msg.id,
+    )
 
     # Decode
     try:
