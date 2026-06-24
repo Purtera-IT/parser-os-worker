@@ -48,7 +48,10 @@ try:
     # Loaders read: SOWSMITH_CONTRASTIVE_TYPE_DIR={DST}/_contrastive_type ,
     #   SOWSMITH_CONTRASTIVE_FACET_DIR={DST}/_contrastive_facet ,
     #   SOWSMITH_TYPE_HEAD_GPU_DIR={DST}/_type_head_gpu/best . Non-fatal.
-    for name in ("contrastive_type.tgz", "contrastive_facet.tgz", "type_head_gpu.tgz"):
+    # contrastive_router.tgz root = _contrastive_router/ (store.npz + knn_meta.json
+    # + best/ bge-base encoder). Loader: SOWSMITH_SERVICE_ROUTER_DIR={DST}/_contrastive_router
+    for name in ("contrastive_type.tgz", "contrastive_facet.tgz", "type_head_gpu.tgz",
+                 "contrastive_router.tgz"):
         tp = os.path.join(DST, name)
         if not os.path.exists(tp):
             continue
