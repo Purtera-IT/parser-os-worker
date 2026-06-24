@@ -106,16 +106,22 @@ class JobMessage:
     manifest_blob_url: str
     domain_pack: str | None = None
     compile_options: dict[str, Any] | None = None
+    # v61: when true, bypass worker-side change-detection (always compile). Read
+    # from a top-level `force` or compile_options.force so any caller can request
+    # a forced re-parse; the timer-driven bulk floods never set it -> get deduped.
+    force: bool = False
 
     @classmethod
     def from_raw(cls, raw: str) -> "JobMessage":
         d = json.loads(raw)
+        opts = d.get("compile_options") or {}
         return cls(
             compile_id=str(d["compile_id"]),
             deal_id=str(d["deal_id"]),
             manifest_blob_url=str(d["manifest_blob_url"]),
             domain_pack=d.get("domain_pack"),
-            compile_options=d.get("compile_options") or {},
+            compile_options=opts,
+            force=bool(d.get("force") or opts.get("force")),
         )
 
 
@@ -162,6 +168,38 @@ def _download_manifest(blob_service: BlobServiceClient, blob_url: str) -> dict[s
     client = blob_service.get_blob_client(container=container, blob=path)
     data = client.download_blob().readall()
     return json.loads(data)
+
+
+def _unchanged_since_last_compile(
+    blob_service: BlobServiceClient, deal_id: str, manifest: dict[str, Any]
+) -> bool:
+    """v61: True when this compile would be REDUNDANT — the deal's input artifacts
+    AND the parser/worker code are byte-identical to the last successful compile's
+    fingerprint (deals/<id>/orbitbrief/latest/compile-idempotency.json). Used to
+    skip the timer-driven bulk floods (hubspot-sync / orbitbrief-runs re-compiling
+    unchanged deals every cycle) that starve interactive work. Fingerprint keys on
+    parser_os_sha/worker_sha too, so a code deploy or an artifact change always
+    re-runs. Fails CLOSED (returns False -> compile) on any error."""
+    try:
+        import hashlib
+        shas = sorted(
+            str(a.get("content_sha256") or "")
+            for a in (manifest.get("artifacts") or [])
+        )
+        artifact_key = hashlib.sha256("\n".join(shas).encode("utf-8")).hexdigest()
+        rec = json.loads(
+            blob_service.get_blob_client(
+                container=BLOB_CONTAINER,
+                blob=f"deals/{deal_id}/orbitbrief/latest/compile-idempotency.json",
+            ).download_blob().readall()
+        )
+        return (
+            rec.get("artifact_key") == artifact_key
+            and rec.get("parser_os_sha") == PARSER_OS_SHA
+            and rec.get("worker_sha") == WORKER_SHA
+        )
+    except Exception:
+        return False
 
 
 def _upload_envelope(
@@ -931,6 +969,25 @@ def main() -> int:
     try:
         log.info("Downloading manifest %s", job.manifest_blob_url)
         manifest = _download_manifest(blob_service, job.manifest_blob_url)
+        # v61: worker-side change-detection — skip a redundant compile when the
+        # deal's artifacts + parser/worker SHA are unchanged since the last
+        # successful one. This is what kills the timer-driven bulk floods
+        # (hubspot-sync / orbitbrief-runs re-compiling unchanged deals every cycle)
+        # that starve interactive work — no matter how they were enqueued. force
+        # bypasses, so a deliberate re-parse always runs.
+        if not job.force and _unchanged_since_last_compile(
+            blob_service, job.deal_id, manifest
+        ):
+            log.info(
+                "Skip (unchanged) deal=%s compile=%s — artifacts + code match last compile",
+                job.deal_id, job.compile_id,
+            )
+            _write_status(
+                blob_service, job, "completed",
+                stage="skipped_unchanged", percent_complete=100,
+            )
+            queue_client.delete_message(msg)
+            return 0
         result = _do_compile(job, manifest, blob_service)
 
         _write_status(
