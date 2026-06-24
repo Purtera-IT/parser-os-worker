@@ -563,41 +563,65 @@ def _do_compile(
         elapsed = time.time() - t0
         log.info("compile_project done in %.1fs", elapsed)
 
-        # v57: mark compile-progress.json as done so the UI stops polling
-        # and can compute a final elapsed total. The 14-stage estimate is
-        # replaced with the real count for accurate progress bar finish.
-        try:
-            final_stages = [
-                {
-                    "stage_name": s.stage_name,
-                    "duration_ms": float(s.duration_ms or 0.0),
-                    "input_count": s.input_count,
-                    "output_count": s.output_count,
-                }
-                for s in getattr(result, "trace", None).stages
-            ] if getattr(result, "trace", None) is not None else []
-            blob_service.get_blob_client(
-                container=BLOB_CONTAINER, blob=progress_path,
-            ).upload_blob(
-                json.dumps({
-                    "compile_id": job.compile_id,
-                    "deal_id": job.deal_id,
-                    "status": "done",
-                    "current_stage": None,
-                    "stages": final_stages,
-                    "stage_count_done": len(final_stages),
-                    "stage_count_total_estimate": len(final_stages) or 14,
-                    "started_at": compile_started_iso,
-                    "updated_at": _iso_now(),
-                    "elapsed_ms": int(elapsed * 1000.0),
-                    "worker_sha": WORKER_SHA,
-                    "parser_os_sha": PARSER_OS_SHA,
-                }, indent=2, default=str).encode("utf-8"),
-                overwrite=True,
-                content_type="application/json",
-            )
-        except Exception as exc:
-            log.warning("compile-progress (done) upload failed: %s", exc)
+        # v58: the parser STAGES are done — but build_orbitbrief_envelope()
+        # below (the OrbitBrief projection: cockpit surfaces, facet sections,
+        # service_routing head) still takes ~90s and IS the deliverable the UI
+        # renders. The old code marked compile-progress "done" HERE — ~90s
+        # before envelope.json existed — so the cockpit showed the pipeline
+        # DONE with NO results ("Parsing… / Results appear when the compile
+        # completes") for that entire window. Keep status "running" through the
+        # projection and flip to "done" only AFTER envelope.json is uploaded
+        # (below), so the tracker hitting DONE coincides with results being
+        # available — the UI's liveDoneButEnvelopeStale gate clears and the
+        # cockpit populates in the SAME poll instead of ~90s later.
+        final_stages = [
+            {
+                "stage_name": s.stage_name,
+                "duration_ms": float(s.duration_ms or 0.0),
+                "input_count": s.input_count,
+                "output_count": s.output_count,
+            }
+            for s in getattr(result, "trace", None).stages
+        ] if getattr(result, "trace", None) is not None else []
+        n_stages = len(final_stages)
+
+        def _write_compile_progress(
+            status: str, current_stage: str | None, total_estimate: int,
+        ) -> None:
+            """Single writer for the post-compile compile-progress.json
+            transitions (projection → done) so they stay byte-consistent."""
+            try:
+                blob_service.get_blob_client(
+                    container=BLOB_CONTAINER, blob=progress_path,
+                ).upload_blob(
+                    json.dumps({
+                        "compile_id": job.compile_id,
+                        "deal_id": job.deal_id,
+                        "status": status,
+                        "current_stage": current_stage,
+                        "stages": final_stages,
+                        "stage_count_done": n_stages,
+                        "stage_count_total_estimate": total_estimate,
+                        "started_at": compile_started_iso,
+                        "updated_at": _iso_now(),
+                        "elapsed_ms": int(
+                            (time.time() - progress_started_perf) * 1000.0
+                        ),
+                        "worker_sha": WORKER_SHA,
+                        "parser_os_sha": PARSER_OS_SHA,
+                    }, indent=2, default=str).encode("utf-8"),
+                    overwrite=True,
+                    content_type="application/json",
+                )
+            except Exception as exc:  # pragma: no cover — best-effort UX
+                log.warning("compile-progress (%s) upload failed: %s", status, exc)
+
+        # Parser stages complete; envelope projection now in flight. Show it as
+        # one extra "projection" stage (N/N+1 ≈ finalizing) so the bar does NOT
+        # read a premature N/N DONE while the deliverable is still being built.
+        _write_compile_progress(
+            "running", "projection", (n_stages + 1) if n_stages else 15,
+        )
 
         # 4a. Build canonical OrbitBrief envelope (atoms/entities/cockpit
         # surfaces).  THIS is what brief gen and SowSmith read.
@@ -622,6 +646,13 @@ def _do_compile(
         # 5a. Upload envelope.json
         env_path = _upload_envelope(blob_service, job.deal_id, envelope)
         log.info("Uploaded envelope to %s", env_path)
+
+        # v58: envelope.json now exists → flip compile-progress to "done".
+        # The cockpit's refetch-on-done fires and renders results in the SAME
+        # poll cycle (≤1.5s while running), because envelope.compile_id now
+        # equals the live "done" compile_id (liveDoneButEnvelopeStale clears).
+        # N/N == 100%. THIS is the write that was previously ~90s too early.
+        _write_compile_progress("done", None, n_stages or 14)
 
         # 5b. Upload scope-process-v1.json sidecar
         try:
@@ -905,6 +936,32 @@ def main() -> int:
 
     except Exception as exc:
         log.exception("Compile failed: %s", exc)
+        # v58: ensure compile-progress.json reaches a TERMINAL state on failure.
+        # We now keep compile-progress "running" through the ~90s envelope
+        # projection (so the tracker doesn't report DONE before results exist),
+        # which means a failure anywhere in the compile must be reflected here —
+        # otherwise the cockpit fast-polls "running" forever and shows "Parsing…"
+        # with no end. Best-effort; the authoritative job status is written below.
+        try:
+            blob_service.get_blob_client(
+                container=BLOB_CONTAINER,
+                blob=f"deals/{job.deal_id}/orbitbrief/latest/compile-progress.json",
+            ).upload_blob(
+                json.dumps({
+                    "compile_id": job.compile_id,
+                    "deal_id": job.deal_id,
+                    "status": "failed",
+                    "current_stage": None,
+                    "updated_at": _iso_now(),
+                    "error": f"{type(exc).__name__}: {exc}"[:500],
+                    "worker_sha": WORKER_SHA,
+                    "parser_os_sha": PARSER_OS_SHA,
+                }, indent=2, default=str).encode("utf-8"),
+                overwrite=True,
+                content_type="application/json",
+            )
+        except Exception:
+            pass
         # Permanent failure (dead deal: manifest/artifact blob deleted) → DROP the
         # message immediately. Otherwise it cycles every visibility_timeout (30min)
         # x MAX_DEQUEUE, clogging the single-slot queue for ~90min and starving
