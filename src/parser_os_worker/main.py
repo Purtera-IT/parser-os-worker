@@ -661,6 +661,37 @@ def _do_compile(
         # N/N == 100%. THIS is the write that was previously ~90s too early.
         _write_compile_progress("done", None, n_stages or 14)
 
+        # v60: write the change-detection fingerprint. parser-os-service reads this
+        # on the next enqueue and SKIPS a redundant compile when the artifacts are
+        # byte-identical — killing the ~4-hourly auto-finalize floods that re-compile
+        # unchanged deals (the queue's main backlog source). Keyed on the sorted set
+        # of artifact content hashes; parser/worker SHAs are recorded for audit.
+        try:
+            import hashlib
+            shas = sorted(
+                str(a.get("content_sha256") or "")
+                for a in (manifest.get("artifacts") or [])
+            )
+            artifact_key = hashlib.sha256(
+                "\n".join(shas).encode("utf-8")
+            ).hexdigest()
+            blob_service.get_blob_client(
+                container=BLOB_CONTAINER,
+                blob=f"deals/{job.deal_id}/orbitbrief/latest/compile-idempotency.json",
+            ).upload_blob(
+                json.dumps({
+                    "artifact_key": artifact_key,
+                    "compile_id": job.compile_id,
+                    "parser_os_sha": PARSER_OS_SHA,
+                    "worker_sha": WORKER_SHA,
+                    "completed_at": _iso_now(),
+                }, indent=2).encode("utf-8"),
+                overwrite=True,
+                content_type="application/json",
+            )
+        except Exception as exc:
+            log.warning("idempotency fingerprint write failed: %s", exc)
+
         # 5b. Upload scope-process-v1.json sidecar
         try:
             scope_path = f"deals/{job.deal_id}/orbitbrief/latest/scope-process-v1.json"
