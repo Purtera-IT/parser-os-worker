@@ -433,6 +433,24 @@ def _upload_atoms(
         overwrite=True,
         content_type="application/json",
     )
+
+    # Full CompileResult (rich atoms + packets with the feature fields) — the
+    # features feed the nightly calibrator fit needs. atoms.json above is a
+    # UI-compact projection that lacks the per-atom signals build_atom_feature_row
+    # consumes. Best-effort: never let it fail the compile.
+    try:
+        if hasattr(result, "model_dump"):
+            rc = blob_service.get_blob_client(
+                container=BLOB_CONTAINER,
+                blob=f"deals/{deal_id}/parser-os/latest/result.json",
+            )
+            rc.upload_blob(
+                json.dumps(result.model_dump(mode="json"), default=str),
+                overwrite=True,
+                content_type="application/json",
+            )
+    except Exception as exc:  # pragma: no cover - calibrator feed is additive
+        log.warning("result.json persist skipped: %s", exc)
     return path
 
 
