@@ -22,9 +22,9 @@ on:
   workflow_dispatch:
     inputs:
       parser_os_ref:
-        description: parser-os ref to bundle (default feat/clean-rubric-heads)
+        description: parser-os ref to bundle (default main)
         required: false
-        default: feat/clean-rubric-heads
+        default: main
 
 permissions:
   id-token: write
@@ -54,7 +54,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Purtera-IT/parser-os
-          ref: ${{ github.event.inputs.parser_os_ref || 'feat/clean-rubric-heads' }}
+          ref: ${{ github.event.inputs.parser_os_ref || 'main' }}
           path: parser-os
           token: ${{ secrets.GH_REPO_TOKEN }}
 
@@ -79,7 +79,7 @@ jobs:
         id: pos
         run: |
           SHA=$(git -C parser-os rev-parse HEAD)
-          REF="${{ github.event.inputs.parser_os_ref || 'feat/clean-rubric-heads' }}"
+          REF="${{ github.event.inputs.parser_os_ref || 'main' }}"
           echo "sha=$SHA" >> $GITHUB_OUTPUT
           echo "ref=$REF" >> $GITHUB_OUTPUT
           echo "Bundled parser-os $REF @ $SHA"
