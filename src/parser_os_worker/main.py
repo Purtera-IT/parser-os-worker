@@ -56,8 +56,8 @@ WORKER_SHA = os.environ.get("PARSER_OS_WORKER_SHA", "unknown")
 PARSER_OS_SHA = os.environ.get("PARSER_OS_SHA", "unknown")
 # v45.2: queue to notify brief-gen worker that a fresh envelope is ready.
 # Empty string disables (worker won't enqueue; useful for ad-hoc replays).
-BRIEF_GEN_QUEUE_NAME = os.environ.get(
-    "BRIEF_GEN_QUEUE_NAME", "parser-os-orbitbrief-jobs"
+POISON_QUEUE_NAME = os.environ.get(
+    "AZURE_STORAGE_QUEUE_POISON", "parser-os-compile-jobs-poison"
 )
 # Prefer connection string (avoids needing Storage Data Contributor role on the
 # managed identity).  Falls back to DefaultAzureCredential when not set.
@@ -79,6 +79,29 @@ log = logging.getLogger("parser-os-worker")
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _is_benign_queue_delete_error(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    if "ResourceNotFound" in name or "MessageNotFound" in name:
+        return True
+    msg = str(exc).lower()
+    return "messagenotfound" in msg or "specified message does not exist" in msg
+
+
+def _safe_delete_queue_message(queue_client: Any, msg: Any, *, context: str = "") -> None:
+    """Delete queue message; visibility-timeout races are benign after success."""
+    try:
+        queue_client.delete_message(msg)
+    except Exception as exc:
+        if _is_benign_queue_delete_error(exc):
+            log.warning(
+                "Queue message already gone after %s (benign ack race): %s",
+                context or "processing",
+                exc,
+            )
+            return
+        raise
 
 
 def _blob_path_from_url(blob_url: str) -> tuple[str, str]:
@@ -213,6 +236,40 @@ def _upload_envelope(
         content_type="application/json",
     )
     return path
+
+
+def _forward_to_poison_queue(
+    queue_service: QueueServiceClient,
+    *,
+    raw_message: str,
+    reason: str,
+    job: "JobMessage | None" = None,
+    dequeue_count: int = 0,
+    source_queue: str = "",
+) -> None:
+    """Archive poison / exhausted messages for ops replay instead of silent drop."""
+    if not POISON_QUEUE_NAME:
+        return
+    try:
+        pqc = queue_service.get_queue_client(
+            POISON_QUEUE_NAME,
+            message_encode_policy=TextBase64EncodePolicy(),
+        )
+        pqc.create_queue()
+        doc = {
+            "reason": reason,
+            "dequeue_count": dequeue_count,
+            "source_queue": source_queue,
+            "forwarded_at": _iso_now(),
+            "original": raw_message,
+        }
+        if job is not None:
+            doc["deal_id"] = job.deal_id
+            doc["compile_id"] = job.compile_id
+        pqc.send_message(json.dumps(doc))
+        log.info("Forwarded poison message to %s (reason=%s)", POISON_QUEUE_NAME, reason)
+    except Exception as exc:
+        log.warning("Failed to forward poison message to %s: %s", POISON_QUEUE_NAME, exc)
 
 
 def _enqueue_brief_gen(
@@ -886,6 +943,23 @@ def main() -> int:
         PARSER_OS_SHA,
     )
 
+    # Job replicas yield to the warm persistent poller when configured — prevents
+    # two consumers racing the same queue message (warm + job MessageNotFound).
+    if os.environ.get("SOWSMITH_DEFER_TO_WARM_WORKER", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        if os.environ.get("WORKER_LOOP", "").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            log.info("SOWSMITH_DEFER_TO_WARM_WORKER — job replica exiting without dequeue")
+            return 0
+
     if CONNECTION_STRING:
         log.info("Using connection-string auth for Storage.")
         queue_service = QueueServiceClient.from_connection_string(CONNECTION_STRING)
@@ -952,14 +1026,23 @@ def main() -> int:
         job = JobMessage.from_raw(raw)
     except Exception as exc:
         log.exception("Poison message — cannot decode: %s", exc)
-        # Drop it so we don't retry forever
-        queue_client.delete_message(msg)
+        poison_raw = msg.content
+        if isinstance(poison_raw, bytes):
+            poison_raw = poison_raw.decode("utf-8", errors="replace")
+        _forward_to_poison_queue(
+            queue_service,
+            raw_message=str(poison_raw),
+            reason="decode_error",
+            dequeue_count=getattr(msg, "dequeue_count", 0),
+            source_queue=source_queue,
+        )
+        _safe_delete_queue_message(queue_client, msg, context="poison decode")
         return 2
 
     # Poison guard: too many retries
     if msg.dequeue_count > MAX_DEQUEUE_COUNT:
         log.error(
-            "Message exceeded MAX_DEQUEUE_COUNT=%d (this dequeue %d), dropping.",
+            "Message exceeded MAX_DEQUEUE_COUNT=%d (this dequeue %d), forwarding to poison.",
             MAX_DEQUEUE_COUNT,
             msg.dequeue_count,
         )
@@ -968,7 +1051,15 @@ def main() -> int:
             stage="exhausted_retries",
             error=f"dequeue_count {msg.dequeue_count} > {MAX_DEQUEUE_COUNT}",
         )
-        queue_client.delete_message(msg)
+        _forward_to_poison_queue(
+            queue_service,
+            raw_message=raw if isinstance(raw, str) else str(raw),
+            reason="exhausted_retries",
+            job=job,
+            dequeue_count=msg.dequeue_count,
+            source_queue=source_queue,
+        )
+        _safe_delete_queue_message(queue_client, msg, context="exhausted retries")
         return 2
 
     # Dev skip-list: ack-and-drop deals we deliberately don't run on this worker
@@ -977,7 +1068,7 @@ def main() -> int:
     # list), not parser logic.
     if job.deal_id in SKIP_DEAL_IDS:
         log.warning("deal_id %s in SOWSMITH_WORKER_SKIP_DEALS — acking without compiling", job.deal_id)
-        queue_client.delete_message(msg)
+        _safe_delete_queue_message(queue_client, msg, context="skip deal")
         return 0
 
     # Mark running
@@ -1004,7 +1095,7 @@ def main() -> int:
                 blob_service, job, "completed",
                 stage="skipped_unchanged", percent_complete=100,
             )
-            queue_client.delete_message(msg)
+            _safe_delete_queue_message(queue_client, msg, context="skipped unchanged")
             return 0
         result = _do_compile(job, manifest, blob_service)
 
@@ -1038,7 +1129,7 @@ def main() -> int:
                 job.deal_id, job.compile_id, exc,
             )
 
-        queue_client.delete_message(msg)
+        _safe_delete_queue_message(queue_client, msg, context="compile success")
         log.info("Job complete: compile_id=%s", job.compile_id)
 
         # Cross-run learning (fully non-fatal, AFTER the result is delivered):
@@ -1105,8 +1196,11 @@ def main() -> int:
         # interactive reparses (the dev "zombie storm"). Transient failures still
         # retry.
         msg_l = f"{type(exc).__name__}: {exc}".lower()
-        permanent = ("notfound" in type(exc).__name__.lower() or "blobnotfound" in msg_l
-                     or "resourcenotfound" in msg_l or "the specified blob does not exist" in msg_l)
+        permanent = (
+            "blobnotfound" in msg_l
+            or "the specified blob does not exist" in msg_l
+            or ("notfound" in type(exc).__name__.lower() and "blob" in msg_l)
+        )
         _write_status(
             blob_service, job, "failed",
             stage=("dead_deal" if permanent else "exception"),
@@ -1116,7 +1210,7 @@ def main() -> int:
         if permanent:
             log.error("Permanent failure (dead deal / missing blob) — dropping message to break the zombie cycle")
             try:
-                queue_client.delete_message(msg)
+                _safe_delete_queue_message(queue_client, msg, context="permanent failure")
             except Exception:
                 pass
             return 2
