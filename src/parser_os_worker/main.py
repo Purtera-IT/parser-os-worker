@@ -567,7 +567,9 @@ def _do_compile(
 
     try:
         # 1. Download artifacts referenced by manifest into project_dir.
-        artifacts = manifest.get("artifacts") or []
+        from app.core.manifest_artifact_dedup import dedupe_manifest_email_artifacts
+
+        artifacts = dedupe_manifest_email_artifacts(manifest.get("artifacts") or [])
         log.info("Downloading %d artifacts to %s", len(artifacts), project_dir)
         for a in artifacts:
             blob_url = a.get("blob_url") or a.get("url")
