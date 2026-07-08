@@ -89,6 +89,7 @@ RUN set -eux; \
       "PyMuPDF>=1.24" \
       "opencv-python-headless>=4.9" \
       "Pillow>=10.0" \
+      "pytesseract>=0.3.10" \
       "pypdfium2>=4.30" \
       "transformers>=4.44"; \
     # CPU-only torch for the B rubric-gate + C span taggers (bge models are tiny;
