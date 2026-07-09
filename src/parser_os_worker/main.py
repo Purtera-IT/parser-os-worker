@@ -567,9 +567,31 @@ def _do_compile(
 
     try:
         # 1. Download artifacts referenced by manifest into project_dir.
-        from app.core.manifest_artifact_dedup import dedupe_manifest_email_artifacts
+        #    Dedupe hs-email rows, then upgrade plain-text stubs to a larger
+        #    multipart sibling already under deals/<deal>/artifacts/*/ so CID
+        #    OCR runs even when the compile base still points at a 2KB stub.
+        from app.core.manifest_artifact_dedup import (
+            dedupe_manifest_email_artifacts,
+            upgrade_stub_hs_email_artifacts_from_siblings,
+        )
 
-        artifacts = dedupe_manifest_email_artifacts(manifest.get("artifacts") or [])
+        def _list_artifact_siblings(container: str, prefix: str) -> list[tuple[str, int]]:
+            client = blob_service.get_container_client(container)
+            out: list[tuple[str, int]] = []
+            for blob in client.list_blobs(name_starts_with=prefix):
+                size = int(getattr(blob, "size", None) or getattr(getattr(blob, "properties", None), "size", 0) or 0)
+                out.append((str(blob.name), size))
+            return out
+
+        account_host = urlparse(
+            str((manifest.get("artifacts") or [{}])[0].get("blob_url") or "")
+        ).netloc or f"{ACCOUNT_NAME}.blob.core.windows.net"
+
+        artifacts = upgrade_stub_hs_email_artifacts_from_siblings(
+            dedupe_manifest_email_artifacts(manifest.get("artifacts") or []),
+            list_blobs=_list_artifact_siblings,
+            account_host=account_host,
+        )
         log.info("Downloading %d artifacts to %s", len(artifacts), project_dir)
         for a in artifacts:
             blob_url = a.get("blob_url") or a.get("url")
