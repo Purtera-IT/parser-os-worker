@@ -54,8 +54,13 @@ SKIP_DEAL_IDS = {d.strip() for d in os.environ.get("SOWSMITH_WORKER_SKIP_DEALS",
 RETRAIN_ENABLED = os.environ.get("SOWSMITH_WORKER_RETRAIN", "1").strip().lower() not in ("0", "false", "no")
 WORKER_SHA = os.environ.get("PARSER_OS_WORKER_SHA", "unknown")
 PARSER_OS_SHA = os.environ.get("PARSER_OS_SHA", "unknown")
-# v45.2: queue to notify brief-gen worker that a fresh envelope is ready.
-# Empty string disables (worker won't enqueue; useful for ad-hoc replays).
+# v45.2: queue to notify brief-gen / Function App that a fresh envelope is ready.
+# Set AZURE_STORAGE_QUEUE_BRIEF_GEN="" to disable enqueue (HTTP trigger still runs).
+# Previously this constant was referenced but never defined → NameError on every
+# compile, so auto OrbitBrief never queued.
+BRIEF_GEN_QUEUE_NAME = os.environ.get(
+    "AZURE_STORAGE_QUEUE_BRIEF_GEN", "parser-os-orbitbrief-jobs"
+)
 POISON_QUEUE_NAME = os.environ.get(
     "AZURE_STORAGE_QUEUE_POISON", "parser-os-compile-jobs-poison"
 )
@@ -122,6 +127,34 @@ def _blob_path_from_url(blob_url: str) -> tuple[str, str]:
     return unquote(parts[0]), unquote(parts[1])
 
 
+def _parse_queue_json(raw: str) -> dict[str, Any]:
+    """Accept plain JSON or base64-wrapped JSON.
+
+    parser-os-service enqueues plain JSON. Some SDK producers use
+    TextBase64EncodePolicy; without a matching decode policy the worker
+    would poison-drop those messages. Try JSON first, then base64→JSON.
+    """
+    import base64
+
+    text = (raw or "").strip()
+    try:
+        out = json.loads(text)
+        if isinstance(out, dict):
+            return out
+    except json.JSONDecodeError:
+        pass
+    try:
+        decoded = base64.b64decode(text, validate=False).decode("utf-8")
+        out = json.loads(decoded)
+        if isinstance(out, dict):
+            return out
+    except Exception as exc:
+        raise ValueError(
+            f"Queue message is neither JSON nor base64 JSON ({type(exc).__name__}: {exc})"
+        ) from exc
+    raise ValueError("Queue message decoded but was not a JSON object")
+
+
 @dataclass
 class JobMessage:
     compile_id: str
@@ -136,7 +169,7 @@ class JobMessage:
 
     @classmethod
     def from_raw(cls, raw: str) -> "JobMessage":
-        d = json.loads(raw)
+        d = _parse_queue_json(raw)
         opts = d.get("compile_options") or {}
         return cls(
             compile_id=str(d["compile_id"]),
@@ -295,7 +328,15 @@ def _enqueue_brief_gen(
         "compileId": job.compile_id,
         "envelopeReady": True,
     }
-    bqc.send_message(json.dumps(payload))
+    try:
+        bqc.send_message(json.dumps(payload))
+    except Exception:
+        # Queue missing in a fresh env — create once and retry.
+        try:
+            queue_service.create_queue(BRIEF_GEN_QUEUE_NAME)
+        except Exception:
+            pass
+        bqc.send_message(json.dumps(payload))
     log.info(
         "Enqueued brief-gen for deal=%s compile=%s on %s",
         job.deal_id,
@@ -308,10 +349,9 @@ def _trigger_brief_gen_http(job: "JobMessage") -> None:
     """Kick brief-gen (PM_HANDOFF etc.) on orbitbrief-core-worker right after the
     parse, so the OrbitBrief page is fresh on EVERY run.
 
-    The intended queue path (parser-os-orbitbrief-jobs -> Function App -> Postgres
-    -> timer -> orbitbrief-core-worker) is not deployed, so this direct HTTP call
-    is the live auto-trigger. Best-effort: any failure just leaves the brief stale;
-    it never fails the compile.
+    Queue path (parser-os-orbitbrief-jobs) is the primary notify; this HTTP call
+    is the live backup when the Function App consumer is slow/absent.
+    Best-effort: any failure just leaves the brief stale; it never fails compile.
 
     NOTE: the worker routes HTTP through the Tailscale proxy (for Ollama), but
     orbitbrief-core-worker is a public Azure ingress URL — so we use an opener with
@@ -321,8 +361,11 @@ def _trigger_brief_gen_http(job: "JobMessage") -> None:
     if not base:
         log.info("ORBITBRIEF_CORE_WORKER_URL unset; skipping brief-gen trigger.")
         return
+    import time as _time
+    import urllib.error
     import urllib.request
     import uuid
+
     bearer = os.environ.get("ORBITBRIEF_CORE_WORKER_BEARER", "").strip()
     run_id = uuid.uuid4().hex
     payload = json.dumps(
@@ -331,14 +374,32 @@ def _trigger_brief_gen_http(job: "JobMessage") -> None:
     headers = {"Content-Type": "application/json"}
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
-    req = urllib.request.Request(
-        f"{base.rstrip('/')}/v1/compile-run?async=1",
-        data=payload, method="POST", headers=headers,
-    )
+    url = f"{base.rstrip('/')}/v1/compile-run?async=1"
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # direct, no proxy
-    with opener.open(req, timeout=15) as resp:
-        log.info("Brief-gen triggered (HTTP %s) deal=%s run=%s",
-                 getattr(resp, "status", "?"), job.deal_id, run_id)
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
+        try:
+            with opener.open(req, timeout=20) as resp:
+                status = getattr(resp, "status", None) or resp.getcode()
+                if 200 <= int(status) < 300:
+                    log.info(
+                        "Brief-gen triggered (HTTP %s) deal=%s run=%s attempt=%s",
+                        status, job.deal_id, run_id, attempt,
+                    )
+                    return
+                body = resp.read()[:300]
+                last_exc = RuntimeError(f"HTTP {status}: {body!r}")
+        except Exception as exc:
+            last_exc = exc
+        log.warning(
+            "Brief-gen HTTP attempt %s failed deal=%s: %s",
+            attempt, job.deal_id, last_exc,
+        )
+        _time.sleep(min(2 * attempt, 6))
+    raise RuntimeError(
+        f"Brief-gen HTTP trigger failed after retries deal={job.deal_id}: {last_exc}"
+    )
 
 
 # v56: Side-channel atoms.json with the raw parser-os atom list — bypasses
@@ -393,6 +454,46 @@ def _serialize_atom_for_ui(atom: Any) -> dict[str, Any]:
     review_status = getattr(atom, "review_status", None)
     review_str = review_status.value if hasattr(review_status, "value") else str(review_status or "")
 
+    value = getattr(atom, "value", {}) or {}
+    if not isinstance(value, dict):
+        value = {}
+    else:
+        value = dict(value)
+    said_by = str(value.get("said_by") or "").strip()
+    speaker = str(value.get("speaker") or "").strip()
+    if not speaker and isinstance(locator, dict):
+        speaker = str(locator.get("speaker") or "").strip()
+    label = said_by or speaker
+    # Prefer "Trent Torrence · Purtera" as the section title for Atom Quality.
+    # STRING (not list): Lovable adaptToEnvelopeAtoms only keeps string paths
+    # (arrays were dropped → silent missing speakers in the audit UI).
+    if label:
+        section_path = label
+        if isinstance(locator, dict):
+            locator = dict(locator)
+            locator["section_path"] = label
+            if speaker and not locator.get("speaker"):
+                locator["speaker"] = speaker
+            if value.get("speaker_role") and not locator.get("speaker_role"):
+                locator["speaker_role"] = value.get("speaker_role")
+            for key in ("affiliation", "party", "voice", "org_role"):
+                if value.get(key) and not locator.get(key):
+                    locator[key] = value.get(key)
+
+    # Heads / embeddings / FeedbackStore must see CLEAN utterance text.
+    # Speaker identity lives on value.speaker / said_by / party / voice —
+    # the UI adapter prefixes for display; do NOT poison raw_text.
+    body = str(value.get("text") or "").strip() or (getattr(atom, "raw_text", "") or "")
+    # Strip a prior display prefix if a bad serialize already wrote one.
+    if label and body.startswith(label) and " — " in body[: len(label) + 4]:
+        body = body.split(" — ", 1)[-1].strip() or body
+    if body:
+        value["text"] = body
+    if speaker and not value.get("speaker"):
+        value["speaker"] = speaker
+    if said_by and not value.get("said_by"):
+        value["said_by"] = said_by
+
     return {
         "id": getattr(atom, "id", ""),
         "atom_type": atom_type_str,
@@ -402,9 +503,9 @@ def _serialize_atom_for_ui(atom: Any) -> dict[str, Any]:
         "receipt_kinds": receipt_kinds,
         "authority_class": authority_str,
         "review_status": review_str,
-        "raw_text": getattr(atom, "raw_text", "") or "",
-        "normalized_text": getattr(atom, "normalized_text", "") or "",
-        "value": getattr(atom, "value", {}) or {},
+        "raw_text": body,
+        "normalized_text": body or (getattr(atom, "normalized_text", "") or ""),
+        "value": value,
         "entity_keys": list(getattr(atom, "entity_keys", []) or []),
         "section_path": section_path,
         "source_artifact_id": source_artifact_id,
@@ -1007,38 +1108,48 @@ def main() -> int:
     # silently use the normal queue (byte-identical to pre-v59 behavior).
     queue_client = queue_service.get_queue_client(QUEUE_NAME)
     source_queue = QUEUE_NAME
-    messages: list = []
+    # Prefer singular receive_message when available (avoids draining the queue
+    # via list(receive_messages(...))). Fall back to a one-message page.
+    msg = None
     try:
         priority_client = queue_service.get_queue_client(PRIORITY_QUEUE_NAME)
-        messages = list(
-            priority_client.receive_messages(
-                visibility_timeout=VISIBILITY_TIMEOUT_SEC,
-                messages_per_page=1,
+        if hasattr(priority_client, "receive_message"):
+            msg = priority_client.receive_message(visibility_timeout=VISIBILITY_TIMEOUT_SEC)
+        else:
+            page = list(
+                priority_client.receive_messages(
+                    visibility_timeout=VISIBILITY_TIMEOUT_SEC,
+                    max_messages=1,
+                )
             )
-        )
-        if messages:
+            msg = page[0] if page else None
+        if msg is not None:
             queue_client = priority_client
             source_queue = PRIORITY_QUEUE_NAME
+            log.info("Priority queue hit (id=%s)", getattr(msg, "id", "?"))
     except Exception as exc:
         log.warning("Priority queue poll failed (%s); using normal queue.", exc)
 
-    if not messages:
+    if msg is None:
         log.info("Dequeuing one message from %s ...", QUEUE_NAME)
-        messages = list(
-            queue_client.receive_messages(
-                visibility_timeout=VISIBILITY_TIMEOUT_SEC,
-                messages_per_page=1,
+        if hasattr(queue_client, "receive_message"):
+            msg = queue_client.receive_message(visibility_timeout=VISIBILITY_TIMEOUT_SEC)
+        else:
+            page = list(
+                queue_client.receive_messages(
+                    visibility_timeout=VISIBILITY_TIMEOUT_SEC,
+                    max_messages=1,
+                )
             )
-        )
+            msg = page[0] if page else None
 
-    if not messages:
+    if msg is None:
         log.info("Both queues empty; nothing to do.")
         return 0
-    msg = messages[0]
 
     log.info(
         "Got message from %s (dequeue_count=%d, id=%s)",
-        source_queue, msg.dequeue_count, msg.id,
+        source_queue, int(getattr(msg, "dequeue_count", 0) or 0), getattr(msg, "id", "?"),
     )
 
     # Decode
@@ -1062,6 +1173,52 @@ def main() -> int:
         )
         _safe_delete_queue_message(queue_client, msg, context="poison decode")
         return 2
+
+    # Ops visibility: warn before poison threshold; log approximate backlog.
+    dq = int(getattr(msg, "dequeue_count", 0) or 0)
+    if dq >= 3:
+        log.error(
+            "High dequeue_count=%d (MAX=%d) deal=%s compile=%s queue=%s — near poison",
+            dq,
+            MAX_DEQUEUE_COUNT,
+            getattr(job, "deal_id", "?"),
+            getattr(job, "compile_id", "?"),
+            source_queue,
+        )
+    try:
+        pri_approx = None
+        main_approx = None
+        try:
+            pri_approx = int(
+                getattr(
+                    queue_service.get_queue_client(PRIORITY_QUEUE_NAME).get_queue_properties(),
+                    "approximate_message_count",
+                    0,
+                )
+                or 0
+            )
+        except Exception:
+            pass
+        try:
+            main_approx = int(
+                getattr(
+                    queue_service.get_queue_client(QUEUE_NAME).get_queue_properties(),
+                    "approximate_message_count",
+                    0,
+                )
+                or 0
+            )
+        except Exception:
+            pass
+        log.info(
+            "Queue depth after receive deal=%s lane=%s priority_approx=%s main_approx=%s",
+            getattr(job, "deal_id", "?"),
+            source_queue,
+            pri_approx,
+            main_approx,
+        )
+    except Exception as exc:
+        log.debug("Queue depth log skipped: %s", exc)
 
     # Poison guard: too many retries
     if msg.dequeue_count > MAX_DEQUEUE_COUNT:

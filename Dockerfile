@@ -100,8 +100,23 @@ RUN set -eux; \
     # encoders were saved with ST 5.6 and silently fail to embed on older versions.
     pip install --no-cache-dir "sentence-transformers>=5.6"; \
     pip install --no-cache-dir ./SowSmith; \
+    # Belt-and-suspenders: reinstall parser-os AFTER SowSmith so a Bang /
+    # purtera-evidence-mvp fork in SowSmith/ cannot overwrite app.* and cause
+    # ModuleNotFoundError: app.core.orbitbrief_envelope at runtime.
+    pip install --no-cache-dir --force-reinstall --no-deps ./parser-os; \
     pip install --no-cache-dir --no-deps ./parser-os-worker; \
-    rm -rf /build
+    # Copy smoke scripts out of /build BEFORE any cleanup. Never rm /build
+    # in this RUN — later RUNs need the scripts (chcn failed when rm ran first).
+    cp ./parser-os-worker/smoke_sowsmith.py /tmp/smoke_sowsmith.py; \
+    cp ./parser-os-worker/smoke_critical_imports.py /tmp/smoke_critical_imports.py
+
+# Guards as separate RUN lines (not inside the backslash-continued pip RUN).
+# ACR dependency scanning mis-parses ``from X import`` inside continued
+# python -c / inlined smoke scripts (failed runs chck/chcj). Smoke scripts
+# use importlib for the same reason.
+RUN python /tmp/smoke_sowsmith.py
+RUN python /tmp/smoke_critical_imports.py
+RUN rm -rf /build /tmp/smoke_sowsmith.py /tmp/smoke_critical_imports.py
 
 WORKDIR /app
 

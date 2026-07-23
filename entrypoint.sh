@@ -85,6 +85,12 @@ export no_proxy="$NO_PROXY"
 # v51: override OLLAMA_HOST to the Mac's Tailscale IP so the proxy
 # forwards through the tailnet instead of trying the legacy HTTPS
 # proxy URL.
+# Preserve the Azure HTTPS proxy (warm yaml OLLAMA_HOST) as fallback —
+# pdf_image_vision / LLM clients try OLLAMA_HOST then OLLAMA_HOST_PROXY.
+# Direct HTTPS must bypass HTTP_PROXY (see pdf_image_vision._session_for_host).
+if [[ -z "${OLLAMA_HOST_PROXY:-}" && -n "${OLLAMA_HOST:-}" ]]; then
+  export OLLAMA_HOST_PROXY="${OLLAMA_HOST}"
+fi
 export OLLAMA_HOST="${OLLAMA_HOST_TAILSCALE:-http://100.114.102.122:11434}"
 
 # Fetch ML deflector artifacts (non-fatal) so the #70/#71 heads + kNN
