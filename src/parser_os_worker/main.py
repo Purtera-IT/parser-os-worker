@@ -636,6 +636,10 @@ def _do_compile(
 
     t_start = time.time()
     started_at = _iso_now()
+    # Prevent Errno 28 recurrence: scrub orphans, then refuse to start if /tmp
+    # is critically low (better a clear poison than a half-written workdir).
+    _scrub_stale_worker_tmp()
+    _assert_tmp_has_space(min_free_bytes=512 * 1024 * 1024)
     work_root = Path(tempfile.mkdtemp(prefix=f"parser-os-worker-{job.compile_id}-"))
     project_dir = work_root / "project"
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -1061,12 +1065,58 @@ def _do_compile(
 # ─── Main loop (well — main one-shot) ──────────────────────────────────────
 
 
+def _tmp_root() -> Path:
+    return Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+
+
+def _scrub_stale_worker_tmp() -> int:
+    """Remove leftover ``parser-os-worker-*`` workdirs (crash / kill orphans)."""
+    root = _tmp_root()
+    removed = 0
+    try:
+        for path in root.glob("parser-os-worker-*"):
+            if not path.is_dir():
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            if not path.exists():
+                removed += 1
+    except Exception as exc:
+        log.warning("tmp scrub failed under %s: %s", root, exc)
+        return removed
+    if removed:
+        log.info("Scrubbed %d stale parser-os-worker-* dir(s) under %s", removed, root)
+    return removed
+
+
+def _assert_tmp_has_space(min_free_bytes: int) -> None:
+    root = _tmp_root()
+    try:
+        usage = shutil.disk_usage(str(root))
+    except Exception as exc:
+        log.warning("disk_usage(%s) failed: %s", root, exc)
+        return
+    if usage.free >= min_free_bytes:
+        return
+    # One more scrub pass, then hard-fail so we don't enqueue disk-full poison.
+    _scrub_stale_worker_tmp()
+    try:
+        usage = shutil.disk_usage(str(root))
+    except Exception:
+        return
+    if usage.free < min_free_bytes:
+        raise OSError(
+            28,
+            f"Insufficient space under {root}: free={usage.free} need>={min_free_bytes}",
+        )
+
+
 def main() -> int:
     log.info(
         "parser-os-worker starting (worker_sha=%s parser_os_sha=%s)",
         WORKER_SHA,
         PARSER_OS_SHA,
     )
+    _scrub_stale_worker_tmp()
 
     # Job replicas yield to the warm persistent poller when configured — prevents
     # two consumers racing the same queue message (warm + job MessageNotFound).

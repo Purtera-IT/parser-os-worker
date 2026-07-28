@@ -97,4 +97,19 @@ export OLLAMA_HOST="${OLLAMA_HOST_TAILSCALE:-http://100.114.102.122:11434}"
 # store fire live; missing -> deflectors abstain -> LLM-only path.
 python /fetch_ml.py || echo "fetch_ml skipped" >&2
 
+# Scrub leftover compile workdirs from prior crashes / OOM kills so /tmp
+# cannot fill again (Errno 28 disk-full → mass queue poison).
+# shellcheck disable=SC2086
+_tmp_root="${TMPDIR:-/tmp}"
+if [[ -d "${_tmp_root}" ]]; then
+  _scrubbed=0
+  for _d in "${_tmp_root}"/parser-os-worker-*; do
+    [[ -e "${_d}" ]] || continue
+    rm -rf "${_d}" && _scrubbed=$((_scrubbed + 1)) || true
+  done
+  if [[ "${_scrubbed}" -gt 0 ]]; then
+    echo "entrypoint: scrubbed ${_scrubbed} stale parser-os-worker-* dir(s) under ${_tmp_root}" >&2
+  fi
+fi
+
 exec "$@"
