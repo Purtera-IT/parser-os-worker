@@ -22,9 +22,14 @@ on:
   workflow_dispatch:
     inputs:
       parser_os_ref:
-        description: parser-os ref to bundle (default main)
+        # NOT `main`. parser-os develops on feat/clean-rubric-heads, and main is
+        # far behind it — main does not even contain app/core/pm_feedback.py or
+        # app/learning/nightly_retrain.py, so a build bundling main silently
+        # ships a worker with no PM-correction loop and no nightly retrain.
+        # Same class of bug that pinned parser-os-service to the ancient v45.2.
+        description: parser-os ref to bundle (default feat/clean-rubric-heads)
         required: false
-        default: main
+        default: feat/clean-rubric-heads
 
 permissions:
   id-token: write
@@ -54,7 +59,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Purtera-IT/parser-os
-          ref: ${{ github.event.inputs.parser_os_ref || 'main' }}
+          ref: ${{ github.event.inputs.parser_os_ref || 'feat/clean-rubric-heads' }}
           path: parser-os
           token: ${{ secrets.GH_REPO_TOKEN }}
 
@@ -79,7 +84,7 @@ jobs:
         id: pos
         run: |
           SHA=$(git -C parser-os rev-parse HEAD)
-          REF="${{ github.event.inputs.parser_os_ref || 'main' }}"
+          REF="${{ github.event.inputs.parser_os_ref || 'feat/clean-rubric-heads' }}"
           echo "sha=$SHA" >> $GITHUB_OUTPUT
           echo "ref=$REF" >> $GITHUB_OUTPUT
           echo "Bundled parser-os $REF @ $SHA"
