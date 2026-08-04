@@ -22,25 +22,23 @@ on:
   workflow_dispatch:
     inputs:
       parser_os_ref:
-        # `main` — and it must stay `main` until the parser-os branches are
-        # reconciled. They have diverged in BOTH directions and neither is a
-        # superset:
-        #   main lacks   app/core/pm_feedback.py, app/learning/nightly_retrain.py
-        #                (no PM-correction loop, no nightly retrain)
-        #   feat/clean-rubric-heads lacks app/core/manifest_artifact_dedup.py
-        #                and 62 other main commits — this worker's main.py
-        #                imports that module, so a build bundling the heads
-        #                branch CRASHES every compile with ModuleNotFoundError.
-        # Verified the hard way on 2026-08-04: rolling dev to a heads-branch
-        # build broke compiles instantly. Bundling main keeps compiles working;
-        # the learning features reach prod via parser-os-service, which is a
-        # separate image. Merging origin/main into feat/clean-rubric-heads
-        # conflicts in 6 core parsing files (semantic_dedup, service_router,
-        # site_geo_fallback, xlsx_parser, site_roster_extractor) and needs a
-        # deliberate decision about which branch is trunk.
-        description: parser-os ref to bundle (default main — see comment above)
+        # ONE ref for every deploy: feat/clean-rubric-heads is the branch that
+        # carries both the parser work and the heads/learning work, and as of
+        # 37bca29 it also carries app/core/manifest_artifact_dedup, which this
+        # worker imports. parser-os `main` is NOT a substitute — it has no
+        # app/core/pm_feedback.py and no app/learning/nightly_retrain.py, so a
+        # main-based worker has no PM-correction loop and no nightly retrain.
+        #
+        # This pairing silently broke once (2026-08-04): the worker added the
+        # manifest_artifact_dedup import, the branch did not have it, and
+        # because worker deploys had been failing since 2026-07-01 on an expired
+        # GH_REPO_TOKEN, dev kept running a July-1 image that predated the
+        # import. The first successful deploy killed every compile.
+        # smoke_critical_imports.py now imports every app.* module the worker
+        # depends on, so an incompatible ref fails the BUILD instead.
+        description: parser-os ref to bundle (default feat/clean-rubric-heads)
         required: false
-        default: main
+        default: feat/clean-rubric-heads
 
 permissions:
   id-token: write
@@ -70,7 +68,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Purtera-IT/parser-os
-          ref: ${{ github.event.inputs.parser_os_ref || 'main' }}
+          ref: ${{ github.event.inputs.parser_os_ref || 'feat/clean-rubric-heads' }}
           path: parser-os
           token: ${{ secrets.GH_REPO_TOKEN }}
 
@@ -95,7 +93,7 @@ jobs:
         id: pos
         run: |
           SHA=$(git -C parser-os rev-parse HEAD)
-          REF="${{ github.event.inputs.parser_os_ref || 'main' }}"
+          REF="${{ github.event.inputs.parser_os_ref || 'feat/clean-rubric-heads' }}"
           echo "sha=$SHA" >> $GITHUB_OUTPUT
           echo "ref=$REF" >> $GITHUB_OUTPUT
           echo "Bundled parser-os $REF @ $SHA"
