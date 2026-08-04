@@ -61,10 +61,16 @@ RUN set -eux; \
     # Install parser-os from local source so it matches the SHA we cloned
     pip install --no-cache-dir ./parser-os; \
     # Install parser-os-service (need projector — no extra deps)
-    pip install --no-cache-dir --no-deps ./parser-os-service; \
-    # Belt-and-suspenders: explicit dep list matching orbitbrief-core-worker's
-    # set so missing-transitively-required modules can't break us silently.
-    pip install --no-cache-dir \
+    pip install --no-cache-dir --no-deps ./parser-os-service
+
+# The heavy installs are split into their own layers ON PURPOSE. As one giant
+# RUN this OOM'd the Standard-SKU ACR build agent — the build died ~2 min into
+# the pip step with no error message, which is what blocked every rebuild and
+# sent us hunting for a local Docker daemon we do not otherwise use. Splitting
+# lets each layer commit and release the builder's memory between installs.
+# Belt-and-suspenders: explicit dep list matching orbitbrief-core-worker's
+# set so missing-transitively-required modules can't break us silently.
+RUN pip install --no-cache-dir \
       "azure-identity>=1.15" \
       "azure-storage-blob>=12.19" \
       "azure-storage-queue>=12.10" \
@@ -91,14 +97,19 @@ RUN set -eux; \
       "Pillow>=10.0" \
       "pytesseract>=0.3.10" \
       "pypdfium2>=4.30" \
-      "transformers>=4.44"; \
-    # CPU-only torch for the B rubric-gate + C span taggers (bge models are tiny;
-    # bge uses WordPiece so no sentencepiece/protobuf needed). The runtime loaders
-    # abstain if absent, so this only enables the deflectors — never breaks.
-    pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu; \
-    # sentence-transformers>=5.6 for the contrastive gate + facet kNN heads — the
-    # encoders were saved with ST 5.6 and silently fail to embed on older versions.
-    pip install --no-cache-dir "sentence-transformers>=5.6"; \
+      "transformers>=4.44"
+
+# CPU-only torch for the B rubric-gate + C span taggers (bge models are tiny;
+# bge uses WordPiece so no sentencepiece/protobuf needed). The runtime loaders
+# abstain if absent, so this only enables the deflectors — never breaks.
+# Its own layer: by far the heaviest single install in the image.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# sentence-transformers>=5.6 for the contrastive gate + facet kNN heads — the
+# encoders were saved with ST 5.6 and silently fail to embed on older versions.
+RUN pip install --no-cache-dir "sentence-transformers>=5.6"
+
+RUN set -eux; \
     pip install --no-cache-dir ./SowSmith; \
     # Belt-and-suspenders: reinstall parser-os AFTER SowSmith so a Bang /
     # purtera-evidence-mvp fork in SowSmith/ cannot overwrite app.* and cause
