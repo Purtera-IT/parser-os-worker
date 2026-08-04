@@ -18,11 +18,28 @@ try:
     # past the queue's message-visibility timeout -> the compile message gets
     # consumed by a still-booting Job and lost (a queue zombie). Skip the junk so
     # boot stays ~1 min.
+    # `_head_registry/` is append-only: every nightly run adds a candidate per
+    # relation and nothing is ever pruned. It reached 14k files / ~5GB, and since
+    # ml-artifacts as a whole is now ~9GB while these containers have 4-8Gi of
+    # ephemeral disk, fetching it filled /tmp and every compile died with
+    # `OSError: [Errno 28] Insufficient space under /tmp`.
+    #
+    # The compile path does not read the registry — serving is via the side-dir
+    # head artifacts, and there are no promoted champions to load. Only the
+    # nightly retrain needs it, to have an incumbent to beat and somewhere to
+    # write the new candidate, so that job opts in with
+    # FETCH_ML_INCLUDE_REGISTRY=1.
+    include_registry = os.environ.get(
+        "FETCH_ML_INCLUDE_REGISTRY", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
     def _skip(name: str) -> bool:
         low = name.lower()
         if low.startswith("dataset/") or low.endswith((".png", ".jpg", ".jpeg", ".zip")):
             return True
         if "_training_" in low or "_runpod_" in low or "_backup_" in low:
+            return True
+        if not include_registry and low.startswith("_head_registry/"):
             return True
         return False
 
