@@ -60,6 +60,23 @@ try:
     # Set on the worker: SOWSMITH_RUBRIC_GATE_DIR={DST}/_gate_rubric/best ,
     #   SOWSMITH_SPAN_GPU_DIR={DST}/_span_gpu/runs . Non-fatal.
     import tarfile
+
+    def _drop_archive(path: str, label: str) -> None:
+        """Delete a tarball once it is safely extracted.
+
+        The archives total ~2.8GB (span_heads_gpu.tgz alone is 1.14GB) and keeping
+        them alongside their extracted contents doubled the footprint to ~5.7GB on
+        containers with 4-8Gi of ephemeral disk. That is what left /tmp with
+        ~480MB free and killed every compile with `OSError: [Errno 28]`. The
+        tarball has no use after extraction — fetch_ml re-downloads it next start.
+        """
+        try:
+            freed = os.path.getsize(path)
+            os.remove(path)
+            print(f"fetch_ml: freed {freed / 1e6:.0f}MB ({label} archive)")
+        except OSError as ex:
+            print(f"fetch_ml: could not drop {label} ({ex})", file=sys.stderr)
+
     for name, sub in (("gate_rubric_best.tgz", "_gate_rubric"),
                       ("span_heads_gpu.tgz", "_span_gpu")):
         tp = os.path.join(DST, name)
@@ -74,6 +91,7 @@ try:
                 except TypeError:
                     tf.extractall(outd)
             print(f"fetch_ml: extracted {name} -> {outd}")
+            _drop_archive(tp, name)
         except Exception as ex:
             print(f"fetch_ml: extract {name} failed ({ex})", file=sys.stderr)
     # Clean-rubric heads (2026-06): contrastive gate + facet kNN stores and the
@@ -96,6 +114,7 @@ try:
                 except TypeError:
                     tf.extractall(DST)
             print(f"fetch_ml: extracted {name} -> {DST}")
+            _drop_archive(tp, name)
         except Exception as ex:
             print(f"fetch_ml: extract {name} failed ({ex})", file=sys.stderr)
 except Exception as e:
