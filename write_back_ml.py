@@ -89,6 +89,27 @@ def main():
                 cc.upload_blob("_training_deepseek.db", f, overwrite=True)
             sent += 1
 
+        # The embedding cache. /tmp is ephemeral, so without this every container
+        # re-embeds everything through the remote qwen3 host — which is the single
+        # biggest time sink in the system:
+        #   * compiles: the type_head layer took 0.5s on a warm cache and 356s on
+        #     a cold one for identical work (2,920 atoms => 23 MINUTES);
+        #   * the nightly: 25,409 rows re-embedded from scratch blew the job's
+        #     replicaTimeout and it was Terminated at exactly 60 minutes.
+        # Only THIS script writes it (the worker entrypoint calls fetch_ml but not
+        # write_back), so there is a single writer and no concurrent clobbering —
+        # everyone else just reads a warm cache.
+        cache_p = os.path.join(DST, "_embed_cache.db")
+        if os.path.isfile(cache_p):
+            try:
+                mb = os.path.getsize(cache_p) / 1e6
+                with open(cache_p, "rb") as f:
+                    cc.upload_blob("_embed_cache.db", f, overwrite=True)
+                sent += 1
+                print(f"write_back_ml: persisted embed cache ({mb:.0f}MB) — warms every container")
+            except Exception as e:
+                print(f"write_back_ml: embed cache upload failed ({e})", file=sys.stderr)
+
         print(
             f"write_back_ml: persisted {sent} artifacts to blob "
             f"({skipped} already current, {deleted} pruned)"
