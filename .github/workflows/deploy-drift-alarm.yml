@@ -1,0 +1,83 @@
+# Fail loudly when this service stops shipping.
+#
+# Between 2026-07-01 and 2026-08-10 every deploy of parser-os-worker failed on
+# an expired PAT. Nothing said so. The running image stayed on the 2026-07-01
+# build for five and a half weeks while the warm app served the queue on three
+# replicas, and it only surfaced because a compile died on a projector fix that
+# had been merged for three days.
+#
+# A red workflow is visible; a workflow nobody looks at is not. This one runs on
+# a schedule and fails -- which emails whoever owns the repo -- when either the
+# last deploy did not succeed or the deployed image has gone stale.
+name: Deploy drift alarm
+
+on:
+  schedule:
+    - cron: "0 13 * * 1-5"   # 13:00 UTC on weekdays — lands before the US morning
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+env:
+  CONTAINER_APP: parser-os-worker-warm
+  CONTAINER_APP_RG: purtera-dev-rg
+  DEPLOY_WORKFLOW: deploy-dev.yml
+  MAX_IMAGE_AGE_DAYS: "14"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Last deploy must have succeeded
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${DEPLOY_WORKFLOW}/runs?status=completed&per_page=10" \
+                   --jq '[.workflow_runs[] | {c:.conclusion, at:.created_at, url:.html_url}]')
+          LAST=$(echo "$RUNS" | jq -r '.[0].c // "none"')
+          if [ "$LAST" = "none" ]; then
+            echo "::warning::no completed deploy runs found — nothing to check yet"
+            exit 0
+          fi
+          if [ "$LAST" != "success" ]; then
+            STREAK=$(echo "$RUNS" | jq -r '[.[] | .c] | index("success") // length')
+            URL=$(echo "$RUNS" | jq -r '.[0].url')
+            echo "::error::THIS SERVICE IS NOT SHIPPING. The last $STREAK deploy run(s) failed. Whatever is on main is NOT what is running. Most recent: $URL"
+            exit 1
+          fi
+          echo "last deploy succeeded"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deployed image must not be stale
+        run: |
+          set -euo pipefail
+          IMAGE=$(az containerapp show --name "$CONTAINER_APP" --resource-group "$CONTAINER_APP_RG" \
+                    --query "properties.template.containers[0].image" -o tsv)
+          echo "deployed image: $IMAGE"
+          DIGEST="${IMAGE##*@}"
+          REPO_PATH="${IMAGE%@*}"; REPO_NAME="${REPO_PATH##*/}"; REGISTRY="${REPO_PATH%%/*}"
+          ACR="${REGISTRY%%.*}"
+          CREATED=$(az acr manifest show-metadata --registry "$ACR" \
+                      --name "${REPO_NAME}@${DIGEST}" --query createdTime -o tsv 2>/dev/null || echo "")
+          if [ -z "$CREATED" ]; then
+            echo "::warning::could not resolve the image build time; skipping the age check"
+            exit 0
+          fi
+          AGE=$(( ( $(date -u +%s) - $(date -u -d "$CREATED" +%s) ) / 86400 ))
+          echo "image built $CREATED (${AGE}d ago)"
+          if [ "$AGE" -gt "$MAX_IMAGE_AGE_DAYS" ]; then
+            echo "::error::The running image is ${AGE} days old (limit ${MAX_IMAGE_AGE_DAYS}). Deploys are green but nothing is reaching production, or nothing has been deployed in a fortnight. Either way what is running is not what is merged."
+            exit 1
+          fi
+          echo "image age within limit"
