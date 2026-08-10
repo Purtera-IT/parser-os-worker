@@ -64,13 +64,34 @@ jobs:
         with:
           path: parser-os-worker
 
+      - name: Preflight - can we read the one private repo we need
+        env:
+          GH_REPO_TOKEN: ${{ secrets.GH_REPO_TOKEN }}
+        run: |
+          # parser-os-service is the ONLY private repo this build needs. When its
+          # PAT expires, actions/checkout fails with "could not read Username for
+          # 'https://github.com'", which names neither the secret nor the repo.
+          # That message cost ~5.5 weeks of silently un-deployed worker images.
+          if [ -z "${GH_REPO_TOKEN:-}" ]; then
+            echo "::error::GH_REPO_TOKEN is not set on this repo. It is required to check out the private repo Purtera-IT/parser-os-service."
+            exit 1
+          fi
+          CODE=$(curl -s -o /dev/null -w '%{http_code}'             -H "Authorization: Bearer $GH_REPO_TOKEN"             -H "Accept: application/vnd.github+json"             https://api.github.com/repos/Purtera-IT/parser-os-service)
+          if [ "$CODE" != "200" ]; then
+            echo "::error::GH_REPO_TOKEN cannot read Purtera-IT/parser-os-service (HTTP $CODE). The PAT is expired or lacks repo scope - rotate it in this repo's Actions secrets. Nothing was built or deployed."
+            exit 1
+          fi
+          echo "GH_REPO_TOKEN can read parser-os-service (HTTP 200)."
+
       - name: Checkout parser-os
         uses: actions/checkout@v4
         with:
           repository: Purtera-IT/parser-os
           ref: ${{ github.event.inputs.parser_os_ref || 'feat/clean-rubric-heads' }}
           path: parser-os
-          token: ${{ secrets.GH_REPO_TOKEN }}
+          # parser-os is public: no credential needed. It used to pass
+          # GH_REPO_TOKEN, which meant an expired PAT failed this checkout too —
+          # widening a one-repo problem into a total deploy outage.
 
       - name: Checkout parser-os-service
         uses: actions/checkout@v4
@@ -87,7 +108,7 @@ jobs:
           repository: Purtera-IT/SowSmith
           ref: main
           path: SowSmith
-          token: ${{ secrets.GH_REPO_TOKEN }}
+          # SowSmith is public: no credential needed (see parser-os above).
 
       - name: Capture parser-os SHA
         id: pos
