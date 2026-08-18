@@ -644,6 +644,22 @@ def _do_compile(
     project_dir = work_root / "project"
     project_dir.mkdir(parents=True, exist_ok=True)
 
+    # Drop the manifest beside the artifacts so the compile can read its own
+    # provenance. parser-os looks for `.parser_manifest.json` in project_dir
+    # (orbitbrief_envelope.PARSER_MANIFEST_SIDECAR) to recover
+    # `context.crm` — the deal name, account and HubSpot id the compile was
+    # requested for. Nothing had ever written that file, so the read always
+    # returned None and `summary.crm` was absent from every envelope we have
+    # ever produced. Anything keyed on the deal's own identity therefore could
+    # not work: the foreign-artifact check declines to guess without it, and
+    # correctly emitted nothing on a deal visibly holding another deal's files.
+    try:
+        (project_dir / ".parser_manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+    except OSError as exc:  # a missing sidecar degrades, it must not fail a compile
+        log.warning("could not write manifest sidecar: %s", exc)
+
     # Compile trace: monkey-patch _call_ollama in both call sites so we record
     # every LLM HTTP call (model, sizes, latency) for byte-identical diff vs
     # Mac local.  Restored in finally to avoid cross-invocation leakage.
