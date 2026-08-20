@@ -76,6 +76,21 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+
+# Azure Core's HttpLoggingPolicy logs the URL, method and every request/response
+# header at INFO -- not DEBUG -- so an INFO root logger turns each storage and
+# queue call into a dozen log lines. Measured on the dev worker: 15,668,964 lines
+# in 7 days, ~8.6 GB, which was the entire cost of the dev Log Analytics
+# workspace and the largest single logging line item in the subscription. The
+# content is header names with values already REDACTED, so it buys nothing.
+#
+# Raise the azure logger specifically rather than the root, so our own INFO logs
+# (stage heartbeats, compile progress) are untouched. Override with
+# PARSER_OS_AZURE_LOG_LEVEL=INFO when actually debugging an SDK call.
+logging.getLogger("azure").setLevel(
+    os.environ.get("PARSER_OS_AZURE_LOG_LEVEL", "WARNING").upper()
+)
+
 log = logging.getLogger("parser-os-worker")
 
 
