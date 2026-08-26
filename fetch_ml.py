@@ -37,6 +37,11 @@ try:
         low = name.lower()
         if low.startswith("dataset/") or low.endswith((".png", ".jpg", ".jpeg", ".zip")):
             return True
+        # Skip training dumps / backups / runpod scratch — but ALWAYS fetch the
+        # live TrainingLog. Without `_training_deepseek.db` the nightly can't
+        # see silver_audit / veto rows, and mid-day seed uploads never land.
+        if low == "_training_deepseek.db":
+            return False
         if "_training_" in low or "_runpod_" in low or "_backup_" in low:
             return True
         if not include_registry and low.startswith("_head_registry/"):
