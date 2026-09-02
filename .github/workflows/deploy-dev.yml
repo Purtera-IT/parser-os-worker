@@ -246,12 +246,24 @@ jobs:
           # against an idle process, and the sentinel is removed by a step that
           # always runs.
           set -uo pipefail
+          if [ "${{ github.event.inputs.force_roll }}" = "true" ]; then
+            echo "force_roll=true — rolling without draining. Whatever is compiling now will be killed."
+            exit 0
+          fi
           ACCT=purpulsedevstg01
           CONTAINER=orbitbrief-artifacts
           echo "drain requested by run ${{ github.run_id }} at $(date -u +%FT%TZ)" > /tmp/drain
-          az storage blob upload --account-name "$ACCT" --container-name "$CONTAINER" \
-            --name control/parser-os-worker.drain --file /tmp/drain --overwrite \
-            --auth-mode login --only-show-errors -o none
+          if ! az storage blob upload --account-name "$ACCT" --container-name "$CONTAINER" \
+                 --name control/parser-os-worker.drain --file /tmp/drain --overwrite \
+                 --auth-mode login --only-show-errors -o none; then
+            # The deploy identity needs "Storage Blob Data Contributor" on the
+            # account. Without it the sentinel cannot be written, and a drain we
+            # cannot request is not a drain — rolling anyway would kill a compile
+            # while claiming to have drained. Fail loudly instead.
+            echo "::error::could not write the drain sentinel (grant the deploy identity Storage Blob Data Contributor on $ACCT)."
+            echo "Re-run with force_roll=true to roll anyway, accepting that the running compile dies."
+            exit 1
+          fi
           echo "drain sentinel written — worker will finish its current message and stop taking new ones"
 
           # Now wait only for the IN-FLIGHT compile, which is bounded by one
