@@ -1141,6 +1141,9 @@ def _assert_tmp_has_space(min_free_bytes: int) -> None:
         )
 
 
+from parser_os_worker.drain import drain_requested
+
+
 def main() -> int:
     log.info(
         "parser-os-worker starting (worker_sha=%s parser_os_sha=%s)",
@@ -1181,6 +1184,35 @@ def main() -> int:
             account_url=f"https://{ACCOUNT_NAME}.blob.core.windows.net",
             credential=cred,
         )
+    # ── drain gate ───────────────────────────────────────────────────────
+    #
+    # Rolling this Container App restarts it, killing whatever compile it is
+    # running. That destroyed three compiles in one batch, and again on 09-02 a
+    # recompile of 010215 was killed mid-run: it wrote a manifest and never an
+    # envelope, which reads downstream as "the compile did nothing" rather than
+    # "the compile was killed".
+    #
+    # The first guard simply waited for an idle worker before rolling. On a busy
+    # dev environment that window never opened -- a deploy on 09-02 waited the
+    # full 15 minutes while two unrelated deals compiled back to back, then
+    # failed. Waiting for quiet cannot be relied on when work is continuous.
+    #
+    # So the deploy DRAINS instead: it writes a sentinel blob, this worker
+    # finishes the message it already holds and then takes no new one, and the
+    # roll happens against an idle process. The sentinel is removed immediately
+    # after the roll.
+    #
+    # Checked here, before either queue is touched, so a message is never
+    # dequeued and then abandoned. A message already in flight is unaffected --
+    # this only stops the NEXT one.
+    #
+    # Fails open: if the sentinel cannot be read (permissions, transient blob
+    # error) the worker keeps consuming. A drain that silently halts the queue
+    # forever is worse than a roll that interrupts one compile.
+    if drain_requested(blob_service, log):
+        log.info("Drain sentinel present — not taking new work (in-flight work is unaffected).")
+        return 0
+
     # v59: drain the PRIORITY queue (interactive re-parses) BEFORE the normal
     # queue (bulk/batch). One message per process (Container Apps Jobs pattern).
     # A user's UI click must never wait behind a bulk backlog — so we always check

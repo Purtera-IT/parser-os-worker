@@ -227,36 +227,50 @@ jobs:
             --resource-group ${{ env.JOB_RG }} \
             --image "${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.img.outputs.digest }}"
 
-      - name: Guard — do not roll while a compile is in flight
+      - name: Drain the warm worker before rolling it
         if: steps.guard.outputs.skip != 'true'
         run: |
-          # Rolling parser-os-worker-warm restarts the container, killing whatever
-          # compile it is running. That has destroyed in-flight work twice: three
-          # compiles in one batch, and again on 09-02 when a recompile of 010215
-          # was killed mid-run and produced a manifest but never an envelope.
+          # Rolling this Container App restarts it, killing whatever compile it is
+          # running. That destroyed three compiles in one batch, and again on
+          # 09-02 a recompile of 010215 was killed mid-run -- it wrote a manifest
+          # and never an envelope, which reads downstream as "the compile did
+          # nothing" rather than "the compile was killed".
           #
-          # The queue being empty is NOT proof of idleness -- the worker dequeues
-          # a message and then works on it for many minutes. The honest signal is
-          # a recent compile heartbeat in its own logs.
+          # The first version of this step simply WAITED for an idle worker. On a
+          # busy environment that window never opens: a deploy on 09-02 waited the
+          # full 15 minutes while two unrelated deals compiled back to back, then
+          # failed. Waiting for quiet cannot be relied on when work is continuous.
+          #
+          # So drain instead. The sentinel stops the worker taking the NEXT
+          # message; the one it already holds finishes normally. Then we roll
+          # against an idle process, and the sentinel is removed by a step that
+          # always runs.
           set -uo pipefail
-          if [ "${{ github.event.inputs.force_roll }}" = "true" ]; then
-            echo "force_roll=true — not waiting."; exit 0
-          fi
-          DEADLINE=$(( $(date +%s) + 900 ))   # wait up to 15 min for it to finish
+          ACCT=purpulsedevstg01
+          CONTAINER=orbitbrief-artifacts
+          echo "drain requested by run ${{ github.run_id }} at $(date -u +%FT%TZ)" > /tmp/drain
+          az storage blob upload --account-name "$ACCT" --container-name "$CONTAINER" \
+            --name control/parser-os-worker.drain --file /tmp/drain --overwrite \
+            --auth-mode login --only-show-errors -o none
+          echo "drain sentinel written — worker will finish its current message and stop taking new ones"
+
+          # Now wait only for the IN-FLIGHT compile, which is bounded by one
+          # compile rather than by how busy the queue is.
+          DEADLINE=$(( $(date +%s) + 1800 ))
           while :; do
             LOGS=$(az containerapp logs show -n parser-os-worker-warm -g "${{ env.JOB_RG }}" \
                      --tail 40 --only-show-errors 2>/dev/null || true)
             BUSY=$(printf '%s' "$LOGS" | grep -c 'compile_stage_heartbeat\|compile_stage_started' || true)
-            IDLE=$(printf '%s' "$LOGS" | grep -c 'queues empty; nothing to do' || true)
-            if [ "${BUSY:-0}" -eq 0 ] || [ "${IDLE:-0}" -gt 0 ]; then
-              echo "worker looks idle — safe to roll."; exit 0
+            DRAINED=$(printf '%s' "$LOGS" | grep -c 'Drain sentinel present' || true)
+            if [ "${DRAINED:-0}" -gt 0 ] || [ "${BUSY:-0}" -eq 0 ]; then
+              echo "worker is drained — safe to roll."; exit 0
             fi
             if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-              echo "::error::a compile still appears to be running after 15 minutes."
-              echo "Rolling now would kill it. Wait, or re-run with force_roll=true."
+              echo "::error::a compile has been running for 30 minutes with the drain in place."
+              echo "That is longer than any healthy compile. Investigate before rolling."
               exit 1
             fi
-            echo "compile in flight — waiting 60s before rolling..."
+            echo "in-flight compile still finishing — checking again in 60s..."
             sleep 60
           done
 
@@ -271,6 +285,18 @@ jobs:
             --name parser-os-worker-warm \
             --resource-group ${{ env.JOB_RG }} \
             --image "${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.img.outputs.digest }}"
+
+      - name: Remove the drain sentinel
+        # always(): a sentinel left behind would silently stop the worker taking
+        # ANY new work — a stalled pipeline nobody is watching, which is worse
+        # than the interrupted compile this whole mechanism exists to prevent.
+        if: always()
+        run: |
+          az storage blob delete --account-name purpulsedevstg01 \
+            --container-name orbitbrief-artifacts \
+            --name control/parser-os-worker.drain \
+            --auth-mode login --only-show-errors -o none 2>/dev/null || true
+          echo "drain sentinel removed"
 
       - name: Verify the rolled image stamps the expected parser-os SHA
         if: steps.guard.outputs.skip != 'true'
