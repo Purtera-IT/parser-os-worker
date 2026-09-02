@@ -144,7 +144,19 @@ jobs:
           fi
 
           if [ -z "$CURRENT" ]; then
-            echo "::warning::the running image carries no parseros-<ref> tag (built before this guard). Allowing, and this deploy will stamp one."
+            # "Unknown" must not mean "go ahead" on an automatic trigger. The
+            # first version of this guard allowed it, and the very first push to
+            # main after merging replaced feat/deal-stage-organisation on dev --
+            # the exact regression the guard exists to prevent, caused by the
+            # guard's own bootstrap path. Not knowing what you are about to
+            # overwrite is the strongest reason not to overwrite it.
+            if [ "${{ github.event_name }}" = "push" ]; then
+              echo "::warning::cannot tell which parser-os ref dev is running (image predates the parseros-<ref> tag). Refusing to replace it automatically. Skipping."
+              echo "Dispatch this workflow once to stamp a tag and take ownership deliberately."
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "::warning::the running image carries no parseros-<ref> tag (built before this guard). A human dispatched this, so proceeding, and this deploy will stamp one."
             exit 0
           fi
 
