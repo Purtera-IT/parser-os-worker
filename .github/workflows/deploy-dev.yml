@@ -116,6 +116,7 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Guard — do not silently replace another agent's ref
+        id: guard
         run: |
           # Dev is one mutable pointer and every deploy is last-writer-wins. When
           # two agents deploy different refs the loser's work vanishes with no
@@ -159,6 +160,17 @@ jobs:
             echo "replacing '$CURRENT' with '$WANT_SLUG', acknowledged."; exit 0
           fi
 
+          # A push to main has no human behind it and cannot pass `replaces`.
+          # Automatic deploys must never take dev away from a ref somebody chose
+          # deliberately -- that is precisely how this feature was lost -- but
+          # they also should not paint CI red for doing their job. Skip instead.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "::warning::dev runs '$CURRENT' (deployed deliberately); a push-triggered deploy of '$WANT_SLUG' would replace it. Skipping."
+            echo "To put '$WANT_SLUG' on dev, dispatch this workflow with replaces='$CURRENT'."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           echo "::error::This deploy would replace parser-os ref '$CURRENT' with '$WANT_SLUG'."
           echo "Someone (or another agent) put '$CURRENT' on dev. Replacing it silently is how"
           echo "the deal-stage feature disappeared twice. If you mean to take it over, re-run"
@@ -166,6 +178,7 @@ jobs:
           exit 1
 
       - name: ACR build
+        if: steps.guard.outputs.skip != 'true'
         run: |
           az acr build \
             --registry ${{ env.ACR_NAME }} \
@@ -181,6 +194,7 @@ jobs:
             .
 
       - name: Resolve THIS build's digest (immutable per-commit tag)
+        if: steps.guard.outputs.skip != 'true'
         id: img
         run: |
           # Resolve the digest of the sha-<commit> tag THIS run just built — it is
@@ -194,6 +208,7 @@ jobs:
           echo "Rolling ${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA:0:12} @ $DIGEST"
 
       - name: Roll Container Apps Job
+        if: steps.guard.outputs.skip != 'true'
         run: |
           az containerapp job update \
             --name ${{ env.JOB_NAME }} \
@@ -201,6 +216,7 @@ jobs:
             --image "${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.img.outputs.digest }}"
 
       - name: Guard — do not roll while a compile is in flight
+        if: steps.guard.outputs.skip != 'true'
         run: |
           # Rolling parser-os-worker-warm restarts the container, killing whatever
           # compile it is running. That has destroyed in-flight work twice: three
@@ -233,6 +249,7 @@ jobs:
           done
 
       - name: Roll the WARM worker Container App (the real queue consumer)
+        if: steps.guard.outputs.skip != 'true'
         run: |
           # parser-os-worker-warm is a long-running Container App that consumes the
           # compile queue and grabs each message before the cold-start Job. It was
@@ -244,6 +261,7 @@ jobs:
             --image "${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.img.outputs.digest }}"
 
       - name: Verify the rolled image stamps the expected parser-os SHA
+        if: steps.guard.outputs.skip != 'true'
         run: |
           # Run the image once (no queue message -> it just prints its baked SHAs
           # and exits) and assert PARSER_OS_SHA matches what we bundled. Fails the
