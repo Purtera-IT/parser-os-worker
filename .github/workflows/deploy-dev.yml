@@ -25,6 +25,22 @@ on:
         description: parser-os ref to bundle (default main — includes skip-veto + silver channel)
         required: false
         default: main
+      replaces:
+        description: >-
+          The parser-os ref you believe is deployed on dev right now. Required
+          only when you are CHANGING it. Deploys are last-writer-wins and Azure
+          records no intent, so a deploy that quietly replaces someone else's
+          ref is indistinguishable from a feature that was never built. Naming
+          what you are overwriting makes that a decision instead of an accident.
+        required: false
+        default: ""
+      force_roll:
+        description: >-
+          Roll the warm worker even if a compile is in flight. Rolling kills
+          whatever is running (it has, twice). Only set this when you know the
+          running compile is expendable.
+        required: false
+        default: "false"
 
 permissions:
   id-token: write
@@ -86,6 +102,12 @@ jobs:
           echo "ref=$REF" >> $GITHUB_OUTPUT
           echo "Bundled parser-os $REF @ $SHA"
 
+      - name: Slug for the parser-os ref (image tags cannot hold a slash)
+        id: slug
+        run: |
+          REF="${{ github.event.inputs.parser_os_ref || 'main' }}"
+          echo "slug=$(printf '%s' "$REF" | tr '/' '_' | tr -cd 'A-Za-z0-9._-')" >> $GITHUB_OUTPUT
+
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
@@ -93,12 +115,76 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Guard — do not silently replace another agent's ref
+        id: guard
+        run: |
+          # Dev is one mutable pointer and every deploy is last-writer-wins. When
+          # two agents deploy different refs the loser's work vanishes with no
+          # error anywhere -- it looks exactly like a feature that was never
+          # built. That happened twice in two days: feat/deal-stage-organisation
+          # went up 09-01 19:58 and was rolled back to a main image built 19
+          # minutes EARLIER, and nothing anywhere said so.
+          #
+          # Each build now carries a `parseros-<ref>` tag, so the running image
+          # can be asked which ref it came from. Changing that ref requires
+          # naming what you are overwriting. This does not stop a deliberate
+          # replacement -- it stops an accidental one.
+          set -uo pipefail
+          WANT="${{ github.event.inputs.parser_os_ref || 'main' }}"
+          RUNNING_IMAGE=$(az containerapp show -n parser-os-worker-warm -g "${{ env.JOB_RG }}" \
+            --query "properties.template.containers[0].image" -o tsv 2>/dev/null | tr -d '\r')
+          DIGEST="${RUNNING_IMAGE##*@}"
+          CURRENT=""
+          if [ -n "$DIGEST" ] && [ "$DIGEST" != "$RUNNING_IMAGE" ]; then
+            TAGS=$(az acr manifest show-metadata --registry "${{ env.ACR_NAME }}" \
+              --name "${{ env.IMAGE_NAME }}@$DIGEST" --query "tags" -o tsv 2>/dev/null | tr '\t\n' '  ')
+            for t in $TAGS; do
+              case "$t" in parseros-*) CURRENT="${t#parseros-}";; esac
+            done
+          fi
+
+          if [ -z "$CURRENT" ]; then
+            echo "::warning::the running image carries no parseros-<ref> tag (built before this guard). Allowing, and this deploy will stamp one."
+            exit 0
+          fi
+
+          WANT_SLUG=$(printf '%s' "$WANT" | tr '/' '_' | tr -cd 'A-Za-z0-9._-')
+          echo "dev currently runs parser-os ref: $CURRENT"
+          echo "this deploy wants:                $WANT_SLUG"
+          if [ "$CURRENT" = "$WANT_SLUG" ]; then
+            echo "same ref — nothing being replaced."; exit 0
+          fi
+
+          ACK=$(printf '%s' "${{ github.event.inputs.replaces }}" | tr '/' '_' | tr -cd 'A-Za-z0-9._-')
+          if [ "$ACK" = "$CURRENT" ]; then
+            echo "replacing '$CURRENT' with '$WANT_SLUG', acknowledged."; exit 0
+          fi
+
+          # A push to main has no human behind it and cannot pass `replaces`.
+          # Automatic deploys must never take dev away from a ref somebody chose
+          # deliberately -- that is precisely how this feature was lost -- but
+          # they also should not paint CI red for doing their job. Skip instead.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "::warning::dev runs '$CURRENT' (deployed deliberately); a push-triggered deploy of '$WANT_SLUG' would replace it. Skipping."
+            echo "To put '$WANT_SLUG' on dev, dispatch this workflow with replaces='$CURRENT'."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "::error::This deploy would replace parser-os ref '$CURRENT' with '$WANT_SLUG'."
+          echo "Someone (or another agent) put '$CURRENT' on dev. Replacing it silently is how"
+          echo "the deal-stage feature disappeared twice. If you mean to take it over, re-run"
+          echo "with replaces='$CURRENT'. If you did not, deploy '$CURRENT' instead."
+          exit 1
+
       - name: ACR build
+        if: steps.guard.outputs.skip != 'true'
         run: |
           az acr build \
             --registry ${{ env.ACR_NAME }} \
             --image "${{ env.IMAGE_NAME }}:${{ env.ENV_TAG }}" \
             --image "${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA:0:12}" \
+            --image "${{ env.IMAGE_NAME }}:parseros-${{ steps.slug.outputs.slug }}" \
             --file parser-os-worker/Dockerfile \
             --build-arg "GIT_SHA=${{ github.sha }}" \
             --build-arg "PARSER_OS_SHA=${{ steps.pos.outputs.sha }}" \
@@ -108,6 +194,7 @@ jobs:
             .
 
       - name: Resolve THIS build's digest (immutable per-commit tag)
+        if: steps.guard.outputs.skip != 'true'
         id: img
         run: |
           # Resolve the digest of the sha-<commit> tag THIS run just built — it is
@@ -121,13 +208,48 @@ jobs:
           echo "Rolling ${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA:0:12} @ $DIGEST"
 
       - name: Roll Container Apps Job
+        if: steps.guard.outputs.skip != 'true'
         run: |
           az containerapp job update \
             --name ${{ env.JOB_NAME }} \
             --resource-group ${{ env.JOB_RG }} \
             --image "${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.img.outputs.digest }}"
 
+      - name: Guard — do not roll while a compile is in flight
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          # Rolling parser-os-worker-warm restarts the container, killing whatever
+          # compile it is running. That has destroyed in-flight work twice: three
+          # compiles in one batch, and again on 09-02 when a recompile of 010215
+          # was killed mid-run and produced a manifest but never an envelope.
+          #
+          # The queue being empty is NOT proof of idleness -- the worker dequeues
+          # a message and then works on it for many minutes. The honest signal is
+          # a recent compile heartbeat in its own logs.
+          set -uo pipefail
+          if [ "${{ github.event.inputs.force_roll }}" = "true" ]; then
+            echo "force_roll=true — not waiting."; exit 0
+          fi
+          DEADLINE=$(( $(date +%s) + 900 ))   # wait up to 15 min for it to finish
+          while :; do
+            LOGS=$(az containerapp logs show -n parser-os-worker-warm -g "${{ env.JOB_RG }}" \
+                     --tail 40 --only-show-errors 2>/dev/null || true)
+            BUSY=$(printf '%s' "$LOGS" | grep -c 'compile_stage_heartbeat\|compile_stage_started' || true)
+            IDLE=$(printf '%s' "$LOGS" | grep -c 'queues empty; nothing to do' || true)
+            if [ "${BUSY:-0}" -eq 0 ] || [ "${IDLE:-0}" -gt 0 ]; then
+              echo "worker looks idle — safe to roll."; exit 0
+            fi
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::a compile still appears to be running after 15 minutes."
+              echo "Rolling now would kill it. Wait, or re-run with force_roll=true."
+              exit 1
+            fi
+            echo "compile in flight — waiting 60s before rolling..."
+            sleep 60
+          done
+
       - name: Roll the WARM worker Container App (the real queue consumer)
+        if: steps.guard.outputs.skip != 'true'
         run: |
           # parser-os-worker-warm is a long-running Container App that consumes the
           # compile queue and grabs each message before the cold-start Job. It was
@@ -139,6 +261,7 @@ jobs:
             --image "${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.img.outputs.digest }}"
 
       - name: Verify the rolled image stamps the expected parser-os SHA
+        if: steps.guard.outputs.skip != 'true'
         run: |
           # Run the image once (no queue message -> it just prints its baked SHAs
           # and exits) and assert PARSER_OS_SHA matches what we bundled. Fails the
