@@ -314,6 +314,19 @@ def _download_manifest(blob_service: BlobServiceClient, blob_url: str) -> dict[s
     return json.loads(data)
 
 
+def _manifest_as_of(manifest: dict[str, Any]) -> str | None:
+    """The run cutoff this manifest was built with, or None for the full corpus."""
+    ctx = manifest.get("context") if isinstance(manifest, dict) else None
+    v = (ctx or {}).get("as_of") if isinstance(ctx, dict) else None
+    v = str(v).strip() if v is not None else ""
+    return v or None
+
+
+def _norm_as_of(v: Any) -> str | None:
+    v = str(v).strip() if v is not None else ""
+    return v or None
+
+
 def _unchanged_since_last_compile(
     blob_service: BlobServiceClient, deal_id: str, manifest: dict[str, Any]
 ) -> bool:
@@ -341,7 +354,18 @@ def _unchanged_since_last_compile(
         )
         # Documents-only: NOT keyed on parser_os_sha/worker_sha, so an unchanged
         # deal never re-runs just because code shipped.
-        return rec.get("artifact_key") == artifact_key
+        #
+        # ...but keyed on the RUN SCOPE too. A cut compile (18 artifacts) and a
+        # full one (72) are different products of the same deal. Keying on the
+        # artifact set alone made each invalidate the other: after a cut, the
+        # next no-op finalize enqueue read "artifacts changed", ran a FULL
+        # recompile, and silently replaced the user's cut envelope (Marion
+        # County, compile 07d69348, 16:14 UTC). A record for a different scope
+        # is not evidence that THIS scope is up to date.
+        return (
+            rec.get("artifact_key") == artifact_key
+            and _norm_as_of(rec.get("as_of")) == _norm_as_of(_manifest_as_of(manifest))
+        )
     except Exception:
         return False
 
@@ -1027,6 +1051,7 @@ def _do_compile(
             ).upload_blob(
                 json.dumps({
                     "artifact_key": artifact_key,
+                    "as_of": _manifest_as_of(manifest),
                     "compile_id": job.compile_id,
                     "parser_os_sha": PARSER_OS_SHA,
                     "worker_sha": WORKER_SHA,
