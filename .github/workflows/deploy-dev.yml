@@ -321,7 +321,11 @@ jobs:
             if [ "${DRAINED:-0}" -gt 0 ] || [ "${BUSY:-0}" -eq 0 ]; then
               echo "worker is drained — safe to roll."; exit 0
             fi
-            SIG=$(printf '%s' "$LOGS" | grep -o '"stage": "[a-z_]*"' | tail -3 | tr -d '\n')
+            # `|| true`: the step runs under bash -e with pipefail, and grep exits 1
+            # when the worker is IDLE (no stage lines in the tail). Without it the
+            # drain died 5s after writing its sentinel -- on exactly the quiet
+            # worker a deploy is supposed to roll straight through.
+            SIG=$(printf '%s' "$LOGS" | grep -o '"stage": "[a-z_]*"' | tail -3 | tr -d '\n' || true)
             if [ "$SIG" != "$LAST_SIG" ]; then
               LAST_SIG="$SIG"; LAST_MOVE=$(date +%s)
             fi
