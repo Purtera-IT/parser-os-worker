@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import shutil
 import sys
 import tempfile
@@ -44,6 +45,14 @@ PRIORITY_QUEUE_NAME = os.environ.get(
 BLOB_CONTAINER = os.environ.get("AZURE_STORAGE_BLOB_CONTAINER", "orbitbrief-artifacts")
 COMPILE_TIMEOUT_SEC = int(os.environ.get("COMPILE_TIMEOUT_SEC", "1500"))  # 25 min hard
 VISIBILITY_TIMEOUT_SEC = int(os.environ.get("MESSAGE_VISIBILITY_TIMEOUT_SEC", "1800"))  # 30 min
+# A compile legitimately runs longer than its lease: source_replay alone took 33
+# minutes on a 17,986-atom deal, whole compiles 45+. When the lease lapses the
+# queue hands the SAME message to the next poll -- dequeue_count=2 was observed
+# live on deal 2fd8baf1 -- and the deal is compiled again from scratch while the
+# first run is still going. That is the "it keeps re-running" symptom. Renew
+# the lease while the compile is in progress instead of guessing a ceiling.
+LEASE_RENEW_SEC = int(os.environ.get("MESSAGE_LEASE_RENEW_SEC", "600"))  # renew every 10 min
+LEASE_MAX_SEC = int(os.environ.get("MESSAGE_LEASE_MAX_SEC", str(4 * 3600)))  # hard stop: 4 h
 MAX_DEQUEUE_COUNT = int(os.environ.get("MAX_DEQUEUE_COUNT", "3"))  # poison after 3 retries
 # Dev skip-list: deal_ids this worker ack-and-drops without compiling. Used to keep
 # a giant deal (e.g. a 20k-atom deal that monopolizes the single LLM) off the dev
@@ -107,6 +116,70 @@ def _is_benign_queue_delete_error(exc: BaseException) -> bool:
         return True
     msg = str(exc).lower()
     return "messagenotfound" in msg or "specified message does not exist" in msg
+
+
+class _LeaseRenewer:
+    """Keep a dequeued message invisible for as long as its compile is running.
+
+    Azure Storage Queues have no server-side "I'm still working" signal; the
+    only lease is the visibility timeout fixed at receive time. A compile that
+    outlives it is redelivered and re-run in parallel. This thread calls
+    update_message on a fixed cadence well inside the lease, and rebinds the
+    message's pop_receipt each time -- every subsequent update AND the final
+    delete must use the newest receipt or the queue rejects them.
+
+    Failure inside here must never take the compile down: a renewal that
+    errors is logged and retried on the next tick. LEASE_MAX_SEC is a backstop
+    against a zombie holding a message forever, not a compile budget.
+    """
+
+    def __init__(self, queue_client: Any, msg: Any, *, every: int, max_total: int, lease: int) -> None:
+        self._q = queue_client
+        self._msg = msg
+        self._every = max(30, int(every))
+        self._max_total = max(self._every, int(max_total))
+        self._lease = int(lease)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="lease-renewer", daemon=True)
+        self.renewals = 0
+        self.errors = 0
+        self._started = time.monotonic()
+
+    def start(self) -> "_LeaseRenewer":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._every):
+            if time.monotonic() - self._started > self._max_total:
+                log.error(
+                    "Lease renewer hit LEASE_MAX_SEC=%ds for message %s; letting the lease lapse.",
+                    self._max_total, getattr(self._msg, "id", "?"),
+                )
+                return
+            try:
+                updated = self._q.update_message(
+                    self._msg, pop_receipt=getattr(self._msg, "pop_receipt", None),
+                    visibility_timeout=self._lease,
+                )
+                new_receipt = getattr(updated, "pop_receipt", None)
+                if new_receipt:
+                    try:
+                        self._msg.pop_receipt = new_receipt
+                    except Exception:
+                        pass
+                self.renewals += 1
+                log.info(
+                    "Renewed queue lease for message %s (renewal #%d, +%ds)",
+                    getattr(self._msg, "id", "?"), self.renewals, self._lease,
+                )
+            except Exception as exc:
+                self.errors += 1
+                log.warning("Queue lease renewal failed (will retry next tick): %s", exc)
 
 
 def _safe_delete_queue_message(queue_client: Any, msg: Any, *, context: str = "") -> None:
@@ -1391,7 +1464,19 @@ def main() -> int:
             )
             _safe_delete_queue_message(queue_client, msg, context="skipped unchanged")
             return 0
-        result = _do_compile(job, manifest, blob_service)
+        renewer = _LeaseRenewer(
+            queue_client, msg,
+            every=LEASE_RENEW_SEC, max_total=LEASE_MAX_SEC, lease=VISIBILITY_TIMEOUT_SEC,
+        ).start()
+        try:
+            result = _do_compile(job, manifest, blob_service)
+        finally:
+            renewer.stop()
+            if renewer.renewals or renewer.errors:
+                log.info(
+                    "Lease renewer: %d renewal(s), %d error(s) over the compile",
+                    renewer.renewals, renewer.errors,
+                )
 
         _write_status(
             blob_service, job, "completed",
