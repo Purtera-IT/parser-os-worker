@@ -182,6 +182,112 @@ class _LeaseRenewer:
                 log.warning("Queue lease renewal failed (will retry next tick): %s", exc)
 
 
+#: The one message this process currently holds, so a termination signal can
+#: hand it back. Live 2026-09-03: the drain sentinel was removed once the roll
+#: started, an OLD replica polled during its shutdown window, took a priority
+#: message at 19:02:45 and was killed. Nothing released the lease, so the deal
+#: sat at "running / discover_artifacts" for the full 30-minute visibility
+#: timeout before anyone else could take it. A killed compile must cost seconds,
+#: not half an hour, and it must say it was killed.
+_INFLIGHT: dict[str, Any] = {}
+
+
+def _compile_accepts_stage_start() -> bool:
+    """True when the bundled parser-os exposes ``stage_start_callback``.
+
+    The worker image can carry an older parser-os than this code expects;
+    passing an unknown keyword would fail every compile, so ask first.
+    """
+    try:
+        import inspect
+        from app.core.compiler import compile_project as _cp
+        return "stage_start_callback" in inspect.signature(_cp).parameters
+    except Exception:
+        return False
+
+
+def _release_inflight(reason: str) -> None:
+    """Make the held message visible again NOW and mark the compile interrupted.
+
+    Best-effort and idempotent: every step is wrapped, because this runs from a
+    signal handler on a process that is about to die either way.
+    """
+    st = dict(_INFLIGHT)
+    _INFLIGHT.clear()
+    if not st:
+        return
+    queue_client, msg, job, blob_service = (
+        st.get("queue_client"), st.get("msg"), st.get("job"), st.get("blob_service"),
+    )
+    try:
+        renewer = st.get("renewer")
+        if renewer is not None:
+            renewer.stop()
+    except Exception:
+        pass
+    try:
+        queue_client.update_message(
+            msg, pop_receipt=getattr(msg, "pop_receipt", None), visibility_timeout=0,
+        )
+        log.warning(
+            "Released queue lease for message %s (%s): visible again immediately",
+            getattr(msg, "id", "?"), reason,
+        )
+    except Exception as exc:
+        log.warning("Could not release queue lease on %s: %s", reason, exc)
+    if job is None or blob_service is None:
+        return
+    try:
+        blob_service.get_blob_client(
+            container=BLOB_CONTAINER,
+            blob=f"deals/{job.deal_id}/orbitbrief/latest/compile-progress.json",
+        ).upload_blob(
+            json.dumps({
+                "compile_id": job.compile_id,
+                "deal_id": job.deal_id,
+                "status": "interrupted",
+                "current_stage": None,
+                "updated_at": _iso_now(),
+                "error": f"worker terminated ({reason}); message released for retry",
+                "worker_sha": WORKER_SHA,
+                "parser_os_sha": PARSER_OS_SHA,
+            }, indent=2, default=str).encode("utf-8"),
+            overwrite=True,
+            content_type="application/json",
+        )
+    except Exception:
+        pass
+    try:
+        _write_status(
+            blob_service, job, "interrupted", stage="terminated",
+            error=f"worker terminated ({reason}); message released for retry",
+        )
+    except Exception:
+        pass
+
+
+def _install_termination_release() -> None:
+    """SIGTERM/SIGINT -> release the in-flight message, then exit 143."""
+    import signal
+
+    def _handler(signum, _frame):
+        name = getattr(signal, "Signals", None)
+        try:
+            label = name(signum).name if name else str(signum)
+        except Exception:
+            label = str(signum)
+        _release_inflight(label)
+        os._exit(143)
+
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handler)
+        except Exception as exc:  # pragma: no cover - non-main thread / platform
+            log.warning("Could not install handler for signal %s: %s", sig, exc)
+
+
 def _safe_delete_queue_message(queue_client: Any, msg: Any, *, context: str = "") -> None:
     """Delete queue message; visibility-timeout races are benign after success."""
     try:
@@ -858,7 +964,7 @@ def _do_compile(
         )
         progress_started_perf = time.time()
 
-        def _on_stage_end(stage, all_stages):  # type: ignore[no-untyped-def]
+        def _write_progress(current_stage, all_stages, *, phase):  # type: ignore[no-untyped-def]
             done = [
                 {
                     "stage_name": s.stage_name,
@@ -872,7 +978,12 @@ def _do_compile(
                 "compile_id": job.compile_id,
                 "deal_id": job.deal_id,
                 "status": "running",
-                "current_stage": stage.stage_name,
+                # The stage running NOW (on start) or the one that just closed
+                # (on end); `stage_phase` says which. Live 010300: the cockpit
+                # sat on "discover_artifacts" through a 171-second parse
+                # because only stage ends were written.
+                "current_stage": current_stage,
+                "stage_phase": phase,
                 "stages": done,
                 "stage_count_done": len(done),
                 "stage_count_total_estimate": 14,
@@ -892,8 +1003,18 @@ def _do_compile(
                     overwrite=True,
                     content_type="application/json",
                 )
+                log.info(
+                    "compile-progress: %s %s (%d stage(s) done)",
+                    phase, current_stage, len(done),
+                )
             except Exception as exc:  # pragma: no cover — best-effort UX
-                log.warning("compile-progress upload failed: %s", exc)
+                log.warning("compile-progress upload failed (%s %s): %s", phase, current_stage, exc)
+
+        def _on_stage_end(stage, all_stages):  # type: ignore[no-untyped-def]
+            _write_progress(stage.stage_name, all_stages, phase="completed")
+
+        def _on_stage_start(stage_name, all_stages):  # type: ignore[no-untyped-def]
+            _write_progress(stage_name, all_stages, phase="running")
 
         # v57: seed compile-progress.json BEFORE compile starts so the
         # UI's polling hook can render a "starting compile…" state the
@@ -936,6 +1057,7 @@ def _do_compile(
             abstain_threshold=opts.get("abstain_threshold"),
             persistence_hook=None,
             stage_callback=_on_stage_end,
+            **({"stage_start_callback": _on_stage_start} if _compile_accepts_stage_start() else {}),
         )
         elapsed = time.time() - t0
         log.info("compile_project done in %.1fs", elapsed)
@@ -1249,6 +1371,7 @@ def main() -> int:
         PARSER_OS_SHA,
     )
     _scrub_stale_worker_tmp()
+    _install_termination_release()
 
     # Job replicas yield to the warm persistent poller when configured — prevents
     # two consumers racing the same queue message (warm + job MessageNotFound).
@@ -1362,6 +1485,8 @@ def main() -> int:
         "Got message from %s (dequeue_count=%d, id=%s)",
         source_queue, int(getattr(msg, "dequeue_count", 0) or 0), getattr(msg, "id", "?"),
     )
+    # From here until the message is deleted, a termination must hand it back.
+    _INFLIGHT.update({"queue_client": queue_client, "msg": msg, "blob_service": blob_service})
 
     # Decode
     try:
@@ -1464,6 +1589,7 @@ def main() -> int:
         return 0
 
     # Mark running
+    _INFLIGHT["job"] = job
     _write_status(blob_service, job, "running", stage="starting", percent_complete=0)
 
     # Do the work
@@ -1493,10 +1619,12 @@ def main() -> int:
             queue_client, msg,
             every=LEASE_RENEW_SEC, max_total=LEASE_MAX_SEC, lease=VISIBILITY_TIMEOUT_SEC,
         ).start()
+        _INFLIGHT["renewer"] = renewer
         try:
             result = _do_compile(job, manifest, blob_service)
         finally:
             renewer.stop()
+            _INFLIGHT.pop("renewer", None)
             if renewer.renewals or renewer.errors:
                 log.info(
                     "Lease renewer: %d renewal(s), %d error(s) over the compile",
@@ -1534,6 +1662,7 @@ def main() -> int:
             )
 
         _safe_delete_queue_message(queue_client, msg, context="compile success")
+        _INFLIGHT.clear()
         log.info("Job complete: compile_id=%s", job.compile_id)
 
         # Cross-run learning (fully non-fatal, AFTER the result is delivered):
