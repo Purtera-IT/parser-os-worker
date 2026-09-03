@@ -231,6 +231,19 @@ jobs:
             --resource-group ${{ env.JOB_RG }} \
             --image "${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.img.outputs.digest }}"
 
+      # The OIDC assertion is valid for ~5 minutes. The ACR build routinely runs
+      # longer than that, so by the time the drain reaches storage the token has
+      # already expired: AADSTS700024, "assertion valid from 07:27:51, expiry
+      # 07:32:51, current time 07:40:22". Re-authenticate so the drain and the
+      # roll run on a live token rather than the build's stale one.
+      - name: Azure login (OIDC) — refresh after the build
+        if: steps.guard.outputs.skip != 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
       - name: Drain the warm worker before rolling it
         if: steps.guard.outputs.skip != 'true'
         run: |
@@ -257,14 +270,26 @@ jobs:
           ACCT=purpulsedevstg01
           CONTAINER=orbitbrief-artifacts
           echo "drain requested by run ${{ github.run_id }} at $(date -u +%FT%TZ)" > /tmp/drain
-          if ! az storage blob upload --account-name "$ACCT" --container-name "$CONTAINER" \
+          # A drain we cannot request is not a drain -- rolling anyway would kill
+          # a compile while claiming to have drained. So fail loudly. But say
+          # WHICH failure it was: this message used to blame a missing
+          # "Storage Blob Data Contributor" role unconditionally, and printed
+          # exactly that when the real error was an expired OIDC token. The
+          # operator then re-checks RBAC that was already correct.
+          if ! ERR=$(az storage blob upload --account-name "$ACCT" --container-name "$CONTAINER" \
                  --name control/parser-os-worker.drain --file /tmp/drain --overwrite \
-                 --auth-mode login --only-show-errors -o none; then
-            # The deploy identity needs "Storage Blob Data Contributor" on the
-            # account. Without it the sentinel cannot be written, and a drain we
-            # cannot request is not a drain — rolling anyway would kill a compile
-            # while claiming to have drained. Fail loudly instead.
-            echo "::error::could not write the drain sentinel (grant the deploy identity Storage Blob Data Contributor on $ACCT)."
+                 --auth-mode login --only-show-errors -o none 2>&1); then
+            echo "$ERR"
+            case "$ERR" in
+              *AADSTS700024*|*"not within its valid time range"*|*ExpiredToken*)
+                echo "::error::the Azure credential expired before the drain could write its sentinel."
+                echo "This is an auth LIFETIME problem, not a permissions problem -- do not go re-check RBAC."
+                echo "The refresh-login step ahead of this one should have renewed it; check that it ran." ;;
+              *AuthorizationPermissionMismatch*|*AuthorizationFailure*|*Forbidden*)
+                echo "::error::the deploy identity lacks Storage Blob Data Contributor on $ACCT." ;;
+              *)
+                echo "::error::could not write the drain sentinel; the az error is printed above." ;;
+            esac
             echo "Re-run with force_roll=true to roll anyway, accepting that the running compile dies."
             exit 1
           fi
