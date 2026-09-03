@@ -59,7 +59,11 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Must exceed the drain deadline below PLUS the ACR build ahead of it.
+    # At 30 the two were equal, so the drain could never reach its own
+    # deadline: the runner cancelled the job first, which skips the roll AND
+    # the verify and leaves the deploy half-done while reporting "cancelled".
+    timeout-minutes: 75
     steps:
       - name: Checkout parser-os-worker
         uses: actions/checkout@v4
@@ -268,7 +272,12 @@ jobs:
 
           # Now wait only for the IN-FLIGHT compile, which is bounded by one
           # compile rather than by how busy the queue is.
-          DEADLINE=$(( $(date +%s) + 1800 ))
+          # Strictly below the job's timeout-minutes minus the build time
+          # ahead of this step, so the drain always resolves on ITS OWN terms
+          # rather than being cancelled mid-wait. A Sodexo-sized compile
+          # (12,904 atoms) legitimately runs 30-45 minutes, so the budget has
+          # to cover one of those or every deploy during a big compile fails.
+          DEADLINE=$(( $(date +%s) + 2700 ))
           while :; do
             LOGS=$(az containerapp logs show -n parser-os-worker-warm -g "${{ env.JOB_RG }}" \
                      --tail 40 --only-show-errors 2>/dev/null || true)
@@ -278,7 +287,7 @@ jobs:
               echo "worker is drained — safe to roll."; exit 0
             fi
             if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-              echo "::error::a compile has been running for 30 minutes with the drain in place."
+              echo "::error::a compile has been running for 45 minutes with the drain in place."
               echo "That is longer than any healthy compile. Investigate before rolling."
               exit 1
             fi
