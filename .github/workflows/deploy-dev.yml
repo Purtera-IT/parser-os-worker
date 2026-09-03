@@ -272,12 +272,22 @@ jobs:
 
           # Now wait only for the IN-FLIGHT compile, which is bounded by one
           # compile rather than by how busy the queue is.
-          # Strictly below the job's timeout-minutes minus the build time
-          # ahead of this step, so the drain always resolves on ITS OWN terms
-          # rather than being cancelled mid-wait. A Sodexo-sized compile
-          # (12,904 atoms) legitimately runs 30-45 minutes, so the budget has
-          # to cover one of those or every deploy during a big compile fails.
-          DEADLINE=$(( $(date +%s) + 2700 ))
+          # Wait on PROGRESS, not on elapsed time. A 45-minute ceiling looked
+          # generous until a real compile blew through it: 86 artifacts, 17,986
+          # atoms, source_replay alone taking 33 minutes. It was perfectly
+          # healthy, and the drain killed the deploy claiming it was "longer
+          # than any healthy compile" -- a statement about compile duration that
+          # this environment simply does not support.
+          #
+          # There is no duration that separates a big compile from a stuck one.
+          # Progress does: a working compile keeps opening and closing stages, a
+          # stuck one stops. So fail only when the stage signature has not moved
+          # for STALL_LIMIT, with a generous absolute ceiling underneath the
+          # job timeout as a backstop.
+          STALL_LIMIT=900          # 15 min with no stage change = stuck
+          DEADLINE=$(( $(date +%s) + 3600 ))
+          LAST_SIG=""
+          LAST_MOVE=$(date +%s)
           while :; do
             LOGS=$(az containerapp logs show -n parser-os-worker-warm -g "${{ env.JOB_RG }}" \
                      --tail 40 --only-show-errors 2>/dev/null || true)
@@ -286,12 +296,24 @@ jobs:
             if [ "${DRAINED:-0}" -gt 0 ] || [ "${BUSY:-0}" -eq 0 ]; then
               echo "worker is drained — safe to roll."; exit 0
             fi
-            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-              echo "::error::a compile has been running for 45 minutes with the drain in place."
-              echo "That is longer than any healthy compile. Investigate before rolling."
+            SIG=$(printf '%s' "$LOGS" | grep -o '"stage": "[a-z_]*"' | tail -3 | tr -d '\n')
+            if [ "$SIG" != "$LAST_SIG" ]; then
+              LAST_SIG="$SIG"; LAST_MOVE=$(date +%s)
+            fi
+            STALLED=$(( $(date +%s) - LAST_MOVE ))
+            if [ "$STALLED" -ge "$STALL_LIMIT" ]; then
+              echo "::error::the in-flight compile has not changed stage in $((STALLED/60)) minutes."
+              echo "A working compile keeps opening and closing stages; this one has stopped."
+              echo "Investigate before rolling, or re-run with force_roll=true to roll over it."
               exit 1
             fi
-            echo "in-flight compile still finishing — checking again in 60s..."
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::drained for 60 minutes and the worker is still busy."
+              echo "The compile was still PROGRESSING, so this is a ceiling, not a stall."
+              echo "Re-run when it finishes, or force_roll=true to roll over it."
+              exit 1
+            fi
+            echo "in-flight compile still finishing (stage moved $((STALLED/60))m ago) — checking again in 60s..."
             sleep 60
           done
 
