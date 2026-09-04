@@ -325,7 +325,12 @@ jobs:
             # when the worker is IDLE (no stage lines in the tail). Without it the
             # drain died 5s after writing its sentinel -- on exactly the quiet
             # worker a deploy is supposed to roll straight through.
-            SIG=$(printf '%s' "$LOGS" | grep -o '"stage": "[a-z_]*"' | tail -3 | tr -d '\n' || true)
+            # Liveness, not stage churn: one long stage (a 35-artifact deal
+            # parsing 9 MB of spreadsheets sat in parse_artifacts for 30+
+            # minutes, 2026-09-04) heartbeats every 30 s with a rising
+            # elapsed_s. A compile that heartbeats is alive; only a compile
+            # whose heartbeat AND stage have both frozen is stuck.
+            SIG=$(printf '%s' "$LOGS" | grep -o '"stage": "[a-z_]*"\|"elapsed_s": [0-9.]*' | tail -3 | tr -d '\n' || true)
             if [ "$SIG" != "$LAST_SIG" ]; then
               LAST_SIG="$SIG"; LAST_MOVE=$(date +%s)
             fi
