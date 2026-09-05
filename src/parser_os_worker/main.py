@@ -118,6 +118,72 @@ def _is_benign_queue_delete_error(exc: BaseException) -> bool:
     return "messagenotfound" in msg or "specified message does not exist" in msg
 
 
+class _CompileWatchdog:
+    """Kill a compile that has outrun ``COMPILE_TIMEOUT_SEC``.
+
+    The constant existed and was set on the live worker, and nothing read it —
+    it was assigned on import and never referenced again, so no compile has ever
+    been bounded. On 2026-09-05 a 35-artifact deal sat in ``parse_artifacts``
+    for 6.8 hours: heartbeating, the two large spreadsheets already parsed, the
+    twenty artifacts left 0-2 KB apiece, and the model host answering in 0.3s.
+    Nothing was being accomplished and nothing was ever going to stop it.
+
+    A blocked C call does not run Python bytecode, so a signal-based deadline
+    can be swallowed by exactly the hang it is meant to catch. This is therefore
+    a plain daemon thread that writes the failure and then takes the process
+    down. Blunt on purpose: the container restarts, the queue message becomes
+    visible again, and ``MAX_DEQUEUE_COUNT`` poisons the deal after three tries
+    instead of one deal holding the only slot forever.
+    """
+
+    #: How long to let the clean status write finish before exiting anyway.
+    GRACE_SEC = 20
+
+    def __init__(self, blob_service: Any, job: Any, timeout_sec: float) -> None:
+        self._blob_service = blob_service
+        self._job = job
+        # float, not int: truncating a sub-second budget to 0 would read as
+        # "disabled" and silently restore the unbounded behaviour this exists
+        # to end. Only a value that is genuinely <= 0 turns the bound off.
+        self._timeout = max(0.0, float(timeout_sec))
+        self._done = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.fired = False
+
+    def start(self) -> "_CompileWatchdog":
+        if self._timeout <= 0:  # 0 disables the bound, deliberately and visibly
+            log.warning("COMPILE_TIMEOUT_SEC=%s — this compile is unbounded.", self._timeout)
+            return self
+        self._thread = threading.Thread(target=self._run, name="compile-watchdog", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._done.set()
+
+    def _run(self) -> None:
+        if self._done.wait(self._timeout):
+            return
+        self.fired = True
+        log.error(
+            "Compile exceeded COMPILE_TIMEOUT_SEC=%ss (deal=%s compile=%s). "
+            "Killing the worker so the slot is freed; the message returns to the queue.",
+            self._timeout, self._job.deal_id, self._job.compile_id,
+        )
+        # Say so on the deal before dying, or the brief shows a run that never
+        # ends and nobody can tell a wedged compile from a slow one.
+        try:
+            _write_status(
+                self._blob_service, self._job, "failed",
+                stage="timeout",
+                error=f"compile exceeded COMPILE_TIMEOUT_SEC={self._timeout:g}s",
+            )
+        except Exception as exc:  # pragma: no cover - best effort before exit
+            log.error("Could not record the timeout on the deal: %s", exc)
+        time.sleep(0.1)
+        os._exit(75)
+
+
 class _LeaseRenewer:
     """Keep a dequeued message invisible for as long as its compile is running.
 
@@ -1620,9 +1686,15 @@ def main() -> int:
             every=LEASE_RENEW_SEC, max_total=LEASE_MAX_SEC, lease=VISIBILITY_TIMEOUT_SEC,
         ).start()
         _INFLIGHT["renewer"] = renewer
+        # The lease renewer keeps the message OURS while we work; it is not a
+        # bound on the work. Without this the only ceiling was LEASE_MAX_SEC,
+        # which merely stops renewing — the compile ran on regardless, and the
+        # released message let the same deal start compiling on top of itself.
+        watchdog = _CompileWatchdog(blob_service, job, COMPILE_TIMEOUT_SEC).start()
         try:
             result = _do_compile(job, manifest, blob_service)
         finally:
+            watchdog.stop()
             renewer.stop()
             _INFLIGHT.pop("renewer", None)
             if renewer.renewals or renewer.errors:
