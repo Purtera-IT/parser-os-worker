@@ -330,7 +330,14 @@ jobs:
             # minutes, 2026-09-04) heartbeats every 30 s with a rising
             # elapsed_s. A compile that heartbeats is alive; only a compile
             # whose heartbeat AND stage have both frozen is stuck.
-            SIG=$(printf '%s' "$LOGS" | grep -o '"stage": "[a-z_]*"\|"elapsed_s": [0-9.]*' | tail -3 | tr -d '\n' || true)
+            # `tr -d '\\'` first: Container Apps returns each line as a JSON
+            # envelope whose "Log" field is itself JSON, so the payload arrives
+            # escaped -- \"stage\": \"parse_artifacts\". Matching the unescaped
+            # form found NOTHING, so SIG was always empty, LAST_SIG never moved,
+            # and every compile longer than STALL_LIMIT was declared stuck. The
+            # liveness check was blind in exactly the case it exists for, and
+            # the deploy failed hardest when the worker was busiest.
+            SIG=$(printf '%s' "$LOGS" | tr -d '\\' | grep -o '"stage": "[a-z_]*"\|"elapsed_s": [0-9.]*' | tail -3 | tr -d '\n' || true)
             if [ "$SIG" != "$LAST_SIG" ]; then
               LAST_SIG="$SIG"; LAST_MOVE=$(date +%s)
             fi
