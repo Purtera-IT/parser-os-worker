@@ -56,4 +56,25 @@ if missing:
         + "\n  ".join(missing)
     )
 
-print(f"critical_imports_ok ({len(WORKER_DEPS)} worker deps verified)")
+# Importing a module is not the same as it having its data.
+#
+# `app/core/geo_reference.py` imports fine with no gazetteer and answers
+# "unknown" to every lookup by design — degrading open is right, but it means a
+# data file dropped from the wheel is INVISIBLE at runtime. That has now
+# happened three times in this package (the OCR wordlist, the lifecycle labels,
+# the postal gazetteer): setuptools ships no non-Python file it is not told
+# about, and the symptom is always a feature that quietly stops working rather
+# than a build that fails.
+#
+# This runs inside the built image, which is the only place the difference
+# between "in the repo" and "in the wheel" is observable.
+from app.core.geo_reference import available as _geo_available  # noqa: E402
+
+if not _geo_available():
+    raise SystemExit(
+        "parser-os installed without its US postal gazetteer — every ZIP and "
+        "city lookup will abstain, and sites will ship with a ZIP and no "
+        "state. Check [tool.setuptools.package-data] in parser-os/pyproject.toml."
+    )
+
+print(f"critical_imports_ok ({len(WORKER_DEPS)} worker deps verified, gazetteer present)")
