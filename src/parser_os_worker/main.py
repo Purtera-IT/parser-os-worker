@@ -448,6 +448,35 @@ def _status_blob_path(job: JobMessage) -> str:
     return f"deals/{job.deal_id}/parser-jobs/{job.compile_id}.json"
 
 
+def _read_status(blob_service: BlobServiceClient, job: JobMessage) -> dict[str, Any] | None:
+    """The last status this worker wrote for this compile, or None."""
+    try:
+        blob_client = blob_service.get_blob_client(container=BLOB_CONTAINER, blob=_status_blob_path(job))
+        data = blob_client.download_blob().readall()
+        payload = json.loads(data if isinstance(data, str) else data.decode("utf-8", errors="replace"))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _previous_attempt_timed_out(blob_service: BlobServiceClient, job: JobMessage) -> bool:
+    """Did an earlier attempt at THIS compile run out of COMPILE_TIMEOUT_SEC?
+
+    The watchdog records ``failed / timeout`` on the deal and kills the
+    process; the queue then hands the same message to the next poll, which
+    runs the same compile against the same budget and dies the same way --
+    up to MAX_DEQUEUE_COUNT times. Measured on the dev worker (2026-09-15,
+    Log Analytics): 5-12 such pickups an hour all day, each holding a replica
+    for the full 25 minutes, while priority compiles queued behind them. A
+    compile that has already exhausted its budget once will exhaust it
+    again; it goes to the poison queue on the second sight, not the fourth.
+    """
+    prev = _read_status(blob_service, job)
+    if not prev or prev.get("compile_id") != job.compile_id:
+        return False
+    return str(prev.get("status") or "") == "failed" and str(prev.get("stage") or "") == "timeout"
+
+
 def _write_status(
     blob_service: BlobServiceClient,
     job: JobMessage,
@@ -1643,6 +1672,29 @@ def main() -> int:
             source_queue=source_queue,
         )
         _safe_delete_queue_message(queue_client, msg, context="exhausted retries")
+        return 2
+
+    # A compile that already ran out of its budget once is not run again: it
+    # would hold a replica for the full budget and die the same way.
+    if msg.dequeue_count > 1 and _previous_attempt_timed_out(blob_service, job):
+        log.error(
+            "Compile %s for deal %s timed out on an earlier attempt (dequeue %d); forwarding to poison instead of re-running.",
+            job.compile_id, job.deal_id, msg.dequeue_count,
+        )
+        _write_status(
+            blob_service, job, "failed",
+            stage="timeout",
+            error=f"compile exceeded COMPILE_TIMEOUT_SEC on an earlier attempt; not re-run (dequeue_count {msg.dequeue_count})",
+        )
+        _forward_to_poison_queue(
+            queue_service,
+            raw_message=raw if isinstance(raw, str) else str(raw),
+            reason="timed_out_before",
+            job=job,
+            dequeue_count=msg.dequeue_count,
+            source_queue=source_queue,
+        )
+        _safe_delete_queue_message(queue_client, msg, context="timed out before")
         return 2
 
     # Dev skip-list: ack-and-drop deals we deliberately don't run on this worker
