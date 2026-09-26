@@ -16,7 +16,51 @@
 #
 # Or use scripts/build_image.sh which does --no-cache + fresh-clone for you.
 
+# ---------------------------------------------------------------------------
+# LibreDWG, built from source, for the CAD parser.
+#
+# A DWG has no pure-Python reader, so `dwg_parser` converts to DXF and reads
+# that with ezdxf. THE VERSION IS THE WHOLE POINT: bookworm ships 0.12.x and
+# conda-forge 0.11, and neither can decode AC1032 (AutoCAD 2018) -- both fail
+# deal 010180's floor plans with
+#
+#     ERROR: Failed to read uncompressed AppInfo section
+#     ERROR: Failed to decode file: SP-6.dwg 0x941
+#
+# 0.14 converts the same drawing to a 5.9MB DXF carrying 147 text entities and
+# the room schedule the deal is priced on ("5'-0\" WORKSTATIONS 106"). An
+# apt-installed LibreDWG would look present and decode nothing, which reads in
+# the logs as a missing converter rather than an old one -- so it is pinned and
+# built here rather than installed.
+#
+# Builder stage: none of the toolchain reaches the runtime image, only the
+# binaries and their shared library.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS libredwg
+ARG LIBREDWG_VERSION=0.14
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl xz-utils \
+    && curl -fsSL -o /tmp/libredwg.tar.xz \
+        "https://github.com/LibreDWG/libredwg/releases/download/${LIBREDWG_VERSION}/libredwg-${LIBREDWG_VERSION}.tar.xz" \
+    && tar -xJf /tmp/libredwg.tar.xz -C /tmp \
+    && cd "/tmp/libredwg-${LIBREDWG_VERSION}" \
+    # --disable-bindings keeps swig, perl and python out of the build; the
+    # worker shells out to dwg2dxf and never imports the library.
+    && ./configure --prefix=/opt/libredwg --disable-bindings --disable-docs \
+    && make -j"$(nproc)" \
+    && make install \
+    && /opt/libredwg/bin/dwg2dxf --version \
+    && rm -rf /tmp/libredwg*
+
 FROM python:3.11-slim AS runtime
+
+# The converter, and the environment variable `dwg_parser.find_converter()`
+# prefers over a PATH lookup -- so an older LibreDWG arriving on PATH by some
+# other route cannot quietly take precedence over this one.
+COPY --from=libredwg /opt/libredwg /opt/libredwg
+ENV PATH="/opt/libredwg/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/libredwg/lib:${LD_LIBRARY_PATH}" \
+    DWG_TO_DXF=/opt/libredwg/bin/dwg2dxf
 
 # v51: install tailscale + curl + iptables so the worker can join the
 # tailnet at startup and reach Mac Studio Ollama directly via
