@@ -16,6 +16,43 @@
 #
 # Or use scripts/build_image.sh which does --no-cache + fresh-clone for you.
 
+# ---------------------------------------------------------------------------
+# dwg2dxf -- so a .dwg is a drawing rather than a placeholder
+#
+# A DWG reaches the parser through a converter. `app/parsers/dwg_parser.py` is
+# complete -- it recovers room labels, layers and coordinates from the DXF --
+# but with no converter on PATH it can only emit "[CAD drawing awaiting
+# conversion]". Live 010180 shipped exactly that: two drawings, two placeholder
+# atoms, zero content, while the same sheet's PDF was read by a vision model
+# that paraphrases what it sees.
+#
+# What the DWG gives that the PDF cannot is the drawing's own text. Measured on
+# 010180's sheet: 721 strings, among them WORKSTATIONS (6'-0" X 2'-6"),
+# PROGRAM SUMMARY, TOTAL HEADCOUNT, and the title block
+# "7 PENN PLAZA / Floor 12 | Suite 1200 | 12,154 RSF". Exact, not described.
+#
+# Debian packages no LibreDWG in any component, so it is built from source.
+# Every part of this was found by failing without it:
+#   version 0.14   : 0.13.3 cannot decode AutoCAD 2018 (READ ERROR 0x940)
+#   --disable-werror : trixie's GCC 14 is stricter than the release expects
+#   pkg-config     : absent from python:3.11-slim, and configure aborts
+# A builder stage keeps the toolchain out of the runtime; only the static
+# binary crosses over.
+FROM python:3.11-slim AS dwgtools
+ARG LIBREDWG_VERSION=0.14
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential curl ca-certificates pkg-config \
+    && curl -fsSL -o /tmp/libredwg.tar.gz \
+        "https://github.com/LibreDWG/libredwg/releases/download/${LIBREDWG_VERSION}/libredwg-${LIBREDWG_VERSION}.tar.gz" \
+    && tar xzf /tmp/libredwg.tar.gz -C /tmp \
+    && cd "/tmp/libredwg-${LIBREDWG_VERSION}" \
+    && ./configure --disable-bindings --disable-shared --enable-static \
+        --disable-werror CFLAGS="-O2 -w" \
+    && make -j"$(nproc)" \
+    && install -m 0755 programs/dwg2dxf /usr/local/bin/dwg2dxf \
+    && rm -rf /tmp/libredwg* /var/lib/apt/lists/*
+
 FROM python:3.11-slim AS runtime
 
 # v51: install tailscale + curl + iptables so the worker can join the
@@ -35,6 +72,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://tailscale.com/install.sh | sh \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# `find_converter()` in dwg_parser.py looks for dwg2dxf on PATH; nothing
+# else wires it up, so the copy IS the integration.
+COPY --from=dwgtools /usr/local/bin/dwg2dxf /usr/local/bin/dwg2dxf
 
 RUN useradd -m -u 10001 parserosworker
 WORKDIR /build
