@@ -553,6 +553,68 @@ def _download_manifest(blob_service: BlobServiceClient, blob_url: str) -> dict[s
     return json.loads(data)
 
 
+#: A deal's standing refusal list, beside its artifacts in blob. One glob or
+#: substring per line, ``#`` comments allowed.
+PARSER_IGNORE_BLOB = "parser-ignore.txt"
+
+
+def _write_deal_parserignore(
+    blob_service: BlobServiceClient, deal_id: str, project_dir: Path
+) -> int:
+    """Copy the deal's ignore list into the workdir, if it has one.
+
+    A deal sometimes has to refuse one of its own artifacts. The commonest
+    case is a meeting HubSpot attached to every deal it touched: one
+    27-minute CDW/Sodexo call is associated with NINE deals and parses to
+    ~417 atoms on each, which on a timeclock installation is 15% of the
+    deal saying nothing about it.
+
+    Editing the manifest does not hold. Auto-finalize rebuilds the manifest
+    from HubSpot within the hour and the artifact returns -- it did twice in
+    one evening, each time costing a ~30 minute compile. Detaching the
+    meeting in HubSpot does hold, but it is a change to a live CRM record
+    and it is the same meeting on eight other deals.
+
+    So the refusal lives with the deal, in blob, where nothing regenerates
+    it: ``deals/<deal>/parser-ignore.txt``. parser-os already honours
+    ``.parserignore`` in the project dir (``_iter_artifacts``), and
+    ``project_census`` reads the same file list, so an ignored artifact is
+    not later reported as undetected content loss. All this does is put the
+    file where the compile already looks.
+
+    Returns the number of patterns written. Never raises: a deal with no
+    list, or an unreadable one, compiles exactly as before.
+    """
+    try:
+        client = blob_service.get_blob_client(
+            container=BLOB_CONTAINER, blob=f"deals/{deal_id}/{PARSER_IGNORE_BLOB}"
+        )
+        if not client.exists():
+            return 0
+        text = client.download_blob().readall().decode("utf-8", errors="ignore")
+    except Exception as exc:
+        log.warning("could not read %s for %s: %s", PARSER_IGNORE_BLOB, deal_id, exc)
+        return 0
+    patterns = [
+        line.strip() for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not patterns:
+        return 0
+    try:
+        (project_dir / ".parserignore").write_text(
+            "\n".join(patterns) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        log.warning("could not write .parserignore: %s", exc)
+        return 0
+    log.info(
+        "deal %s refuses %d pattern(s): %s",
+        deal_id, len(patterns), ", ".join(patterns[:5]),
+    )
+    return len(patterns)
+
+
 def _manifest_as_of(manifest: dict[str, Any]) -> str | None:
     """The run cutoff this manifest was built with, or None for the full corpus."""
     ctx = manifest.get("context") if isinstance(manifest, dict) else None
@@ -1040,6 +1102,11 @@ def _do_compile(
         )
     except OSError as exc:  # a missing sidecar degrades, it must not fail a compile
         log.warning("could not write manifest sidecar: %s", exc)
+
+    # A deal's standing refusal list, if it has one. Written beside the
+    # artifacts so the compile's own ignore mechanism picks it up, and so it
+    # survives the manifest being rebuilt from HubSpot.
+    _write_deal_parserignore(blob_service, job.deal_id, project_dir)
 
     # Compile trace: monkey-patch _call_ollama in both call sites so we record
     # every LLM HTTP call (model, sizes, latency) for byte-identical diff vs
