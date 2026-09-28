@@ -43,7 +43,21 @@ PRIORITY_QUEUE_NAME = os.environ.get(
     "AZURE_STORAGE_QUEUE_PRIORITY", "parser-os-compile-jobs-priority"
 )
 BLOB_CONTAINER = os.environ.get("AZURE_STORAGE_BLOB_CONTAINER", "orbitbrief-artifacts")
-COMPILE_TIMEOUT_SEC = int(os.environ.get("COMPILE_TIMEOUT_SEC", "1500"))  # 25 min hard
+COMPILE_TIMEOUT_SEC = int(os.environ.get("COMPILE_TIMEOUT_SEC", "1500"))  # 25 min floor
+#: Seconds of budget per document in the manifest, on top of the floor.
+#:
+#: A flat 25 minutes is not a budget, it is a bet that every deal is the same
+#: size. They are not. 010180 has 9 documents and compiles in 3 minutes;
+#: 010347 has 68 and spent 881s in `parse_artifacts` alone -- 13s a document,
+#: 59% of the whole allowance -- then died at `bom_owner` with every stage
+#: after it unrun. 010264 did the same at ~18s a document. Both were reported
+#: as "still parsing after 120 minutes", which they were not: they were dead,
+#: deterministically, and re-running them as-is fails the same way.
+#:
+#: 45s is deliberately generous against the 13-18s observed, because the
+#: downstream stages grow with the ATOM count and a 68-document deal produced
+#: 8,486 atoms where a 9-document one produced 249.
+COMPILE_SEC_PER_DOC = float(os.environ.get("COMPILE_SEC_PER_DOC", "45"))
 VISIBILITY_TIMEOUT_SEC = int(os.environ.get("MESSAGE_VISIBILITY_TIMEOUT_SEC", "1800"))  # 30 min
 # A compile legitimately runs longer than its lease: source_replay alone took 33
 # minutes on a 17,986-atom deal, whole compiles 45+. When the lease lapses the
@@ -54,6 +68,30 @@ VISIBILITY_TIMEOUT_SEC = int(os.environ.get("MESSAGE_VISIBILITY_TIMEOUT_SEC", "1
 LEASE_RENEW_SEC = int(os.environ.get("MESSAGE_LEASE_RENEW_SEC", "600"))  # renew every 10 min
 LEASE_MAX_SEC = int(os.environ.get("MESSAGE_LEASE_MAX_SEC", str(4 * 3600)))  # hard stop: 4 h
 MAX_DEQUEUE_COUNT = int(os.environ.get("MAX_DEQUEUE_COUNT", "3"))  # poison after 3 retries
+#: How much of the lease a compile may spend. The lease RENEWER keeps the
+#: message ours for as long as we work, so the ceiling is LEASE_MAX_SEC and not
+#: the visibility timeout -- raising the compile budget past
+#: MESSAGE_VISIBILITY_TIMEOUT_SEC does NOT cause a duplicate compile, which is
+#: the thing that made a bigger budget look unsafe. Staying under the lease
+#: backstop is what matters, with room for the status write on the way out.
+COMPILE_BUDGET_LEASE_FRACTION = float(
+    os.environ.get("COMPILE_BUDGET_LEASE_FRACTION", "0.75"))
+
+
+def compile_budget_sec(manifest: Any) -> float:
+    """The seconds this particular compile gets, from how much work it is.
+
+    Floor is COMPILE_TIMEOUT_SEC so small deals are unchanged. Ceiling is a
+    fraction of LEASE_MAX_SEC so a pathological manifest cannot outlive the
+    lease that keeps its message invisible.
+    """
+    try:
+        docs = len((manifest or {}).get("artifacts") or [])
+    except Exception:  # noqa: BLE001 - a malformed manifest gets the floor
+        docs = 0
+    ceiling = max(float(COMPILE_TIMEOUT_SEC),
+                  LEASE_MAX_SEC * COMPILE_BUDGET_LEASE_FRACTION)
+    return min(ceiling, max(float(COMPILE_TIMEOUT_SEC), COMPILE_SEC_PER_DOC * docs))
 # Dev skip-list: deal_ids this worker ack-and-drops without compiling. Used to keep
 # a giant deal (e.g. a 20k-atom deal that monopolizes the single LLM) off the dev
 # worker so interactive reparses always get the slot. Comma-separated; reversible.
@@ -1781,7 +1819,13 @@ def main() -> int:
         # bound on the work. Without this the only ceiling was LEASE_MAX_SEC,
         # which merely stops renewing — the compile ran on regardless, and the
         # released message let the same deal start compiling on top of itself.
-        watchdog = _CompileWatchdog(blob_service, job, COMPILE_TIMEOUT_SEC).start()
+        budget = compile_budget_sec(manifest)
+        log.info(
+            "Compile budget %.0fs for %d document(s) (floor %ds, %.0fs/doc)",
+            budget, len((manifest or {}).get("artifacts") or []),
+            COMPILE_TIMEOUT_SEC, COMPILE_SEC_PER_DOC,
+        )
+        watchdog = _CompileWatchdog(blob_service, job, budget).start()
         try:
             result = _do_compile(job, manifest, blob_service)
         finally:

@@ -80,7 +80,16 @@ def test_the_watchdog_thread_does_not_outlive_the_compile(job, monkeypatch):
 
 
 def test_the_constant_is_actually_used_now():
-    """The whole defect: it was assigned and never read."""
+    """The whole defect: it was assigned and never read.
+
+    The watchdog is no longer handed the constant directly — it gets a budget
+    scaled to the deal's document count, because a flat 1500s killed every
+    deal past ~33 documents. So the invariant is not "the constant appears in
+    the constructor call", it is "the constant still BOUNDS the compile":
+    `compile_budget_sec` uses it as the floor, and its result is what the
+    watchdog gets. Asserting the old shape would have blocked the fix while
+    still permitting the defect it was written for.
+    """
     import inspect
 
     src = inspect.getsource(m)
@@ -89,4 +98,7 @@ def test_the_constant_is_actually_used_now():
         if "COMPILE_TIMEOUT_SEC" in ln and not ln.strip().startswith("#")
     ]
     assert len(uses) >= 2, "assigned and never referenced is how this happened"
-    assert any("_CompileWatchdog(" in ln for ln in uses)
+    assert any("_CompileWatchdog(" in ln and "budget" in ln
+               for ln in src.splitlines()), "the watchdog must be given a bound"
+    # and that bound must still be derived from the constant
+    assert inspect.getsource(m.compile_budget_sec).count("COMPILE_TIMEOUT_SEC") >= 2
