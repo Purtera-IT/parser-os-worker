@@ -928,6 +928,36 @@ def _upload_atoms(
 # ─── The actual compile ───────────────────────────────────────────────────
 
 
+def _upload_sheet_renders(blob_service, deal_id: str, project_dir) -> int:
+    """Publish parser-os's `*.sheet.svg` renders so the UI can show a drawing.
+
+    Best-effort by design: a picture is a convenience, and a compile that
+    parsed a drawing correctly must not fail because its render could not be
+    stored. Named by the SOURCE stem so a caller who knows the artifact
+    filename can construct the URL without an index.
+    """
+    from pathlib import Path as _Path  # noqa: PLC0415
+
+    count = 0
+    try:
+        for svg in _Path(project_dir).rglob("*.sheet.svg"):
+            try:
+                body = svg.read_text(encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                continue
+            stem = svg.name[: -len(".sheet.svg")]
+            blob_service.get_blob_client(
+                container=BLOB_CONTAINER,
+                blob=f"deals/{deal_id}/parser-os/latest/sheets/{stem}.svg",
+            ).upload_blob(body, overwrite=True, content_type="image/svg+xml")
+            count += 1
+    except Exception as exc:  # pragma: no cover - renders are additive
+        log.warning("sheet render upload skipped: %s", exc)
+    if count:
+        log.info("Uploaded %d sheet render(s)", count)
+    return count
+
+
 def _do_compile(
     job: JobMessage,
     manifest: dict[str, Any],
@@ -1236,6 +1266,15 @@ def _do_compile(
         scope_process_v1 = to_scope_process_v1(
             result, manifest=manifest, manifest_blob_url=job.manifest_blob_url,
         )
+
+        # 4c. The drawings, as pictures a PM can actually open.
+        #
+        # parser-os renders every .dwg it converts to a vector SVG beside the
+        # artifact. `project_dir` is a scratch directory this replica deletes
+        # on exit, so without this the render is made and thrown away -- and
+        # the labeling pane keeps showing "…SP-6.dwg can't be previewed
+        # inline" beside a deal whose entire scope came off that sheet.
+        _upload_sheet_renders(blob_service, job.deal_id, project_dir)
 
         # 5a. Upload envelope.json
         env_path = _upload_envelope(blob_service, job.deal_id, envelope)
