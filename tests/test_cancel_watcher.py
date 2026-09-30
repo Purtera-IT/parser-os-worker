@@ -25,7 +25,8 @@ from parser_os_worker import main as m
 
 @pytest.fixture
 def job():
-    return SimpleNamespace(deal_id="d1", compile_id="c1")
+    # Mirrors the real JobMessage, which now carries who asked for the run.
+    return SimpleNamespace(deal_id="d1", compile_id="c1", triggered_by="griffin@purtera-it.com")
 
 
 class FakeBlob:
