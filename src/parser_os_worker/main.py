@@ -348,6 +348,7 @@ class _CancelWatcher:
                         "started_at": self._started_iso,
                         "updated_at": _iso_now(),
                         "cancelled_by": by,
+                        "triggered_by": self._job.triggered_by,
                         "worker_sha": WORKER_SHA,
                         "parser_os_sha": PARSER_OS_SHA,
                     }, indent=2).encode("utf-8"),
@@ -620,6 +621,11 @@ class JobMessage:
     # from a top-level `force` or compile_options.force so any caller can request
     # a forced re-parse; the timer-driven bulk floods never set it -> get deduped.
     force: bool = False
+    #: Who asked for this compile. The queue message has carried it all along --
+    #: every producer sets it -- and this class dropped it on the floor, so the
+    #: progress record could not say who started a run and the queue panel had
+    #: nothing to show against a compile once it stopped being a queued message.
+    triggered_by: str | None = None
 
     @classmethod
     def from_raw(cls, raw: str) -> "JobMessage":
@@ -632,6 +638,9 @@ class JobMessage:
             domain_pack=d.get("domain_pack"),
             compile_options=opts,
             force=bool(d.get("force") or opts.get("force")),
+            triggered_by=(
+                str(d.get("triggered_by") or d.get("triggeredBy") or "").strip() or None
+            ),
         )
 
 
@@ -1313,6 +1322,9 @@ def _do_compile(
                 ),
                 "worker_sha": WORKER_SHA,
                 "parser_os_sha": PARSER_OS_SHA,
+                # Who asked for it. A running compile is no longer a queue
+                # message, so this record is the only place left that knows.
+                "triggered_by": job.triggered_by,
             }
             try:
                 blob_service.get_blob_client(
@@ -1356,6 +1368,7 @@ def _do_compile(
                     "elapsed_ms": 0,
                     "worker_sha": WORKER_SHA,
                     "parser_os_sha": PARSER_OS_SHA,
+                    "triggered_by": job.triggered_by,
                 }, indent=2).encode("utf-8"),
                 overwrite=True,
                 content_type="application/json",
