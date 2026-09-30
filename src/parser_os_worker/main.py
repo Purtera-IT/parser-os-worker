@@ -218,6 +218,10 @@ class _CompileWatchdog:
             )
         except Exception as exc:  # pragma: no cover - best effort before exit
             log.error("Could not record the timeout on the deal: %s", exc)
+        try:
+            _clear_compile_active(self._blob_service, self._job)
+        except Exception:
+            pass
         time.sleep(0.1)
         os._exit(75)
 
@@ -225,6 +229,74 @@ class _CompileWatchdog:
 #: Where a request to stop a deal's running compile is written. One per deal,
 #: beside the progress file the panel already reads, so the same SAS and the
 #: same container serve both.
+#: One tiny blob per RUNNING compile, under a flat prefix.
+#:
+#: The queue panel used to answer "what is compiling?" by listing every deal
+#: folder and reading all ~500 progress documents. Measured against live dev
+#: that is 911ms just to list the folders, before a single read -- so the
+#: endpoint took 4-6s on a consumption plan and the panel polled at 2s against
+#: an answer it could not get in 2s.
+#:
+#: The worker already knows. It writes a marker when it starts and deletes it
+#: when it stops, so the reader lists ONE small prefix: 231ms for the listing
+#: and 122ms for four parallel reads, measured the same way.
+#:
+#: Named by compile id, not deal id: a deal can legitimately have two compiles
+#: in flight, and keying on the deal would have one silently erase the other.
+ACTIVE_INDEX_PREFIX = "_active-compiles"
+
+
+def _active_index_path(compile_id: str) -> str:
+    return f"{ACTIVE_INDEX_PREFIX}/{compile_id}.json"
+
+
+def _mark_compile_active(
+    blob_service: BlobServiceClient, job: "JobMessage", stage: str | None = None
+) -> None:
+    """Say, in one small blob, that this compile is running.
+
+    Best-effort on purpose. This is an INDEX, not the truth: the progress
+    document remains the record, and a reader that finds a marker still reads
+    the progress beside it. A marker that fails to write costs a compile its
+    place in a fast listing, not its existence -- the periodic full sweep on
+    the reading side still finds it.
+    """
+    try:
+        blob_service.get_blob_client(
+            container=BLOB_CONTAINER, blob=_active_index_path(job.compile_id),
+        ).upload_blob(
+            json.dumps({
+                "compile_id": job.compile_id,
+                "deal_id": job.deal_id,
+                "stage": stage,
+                "updated_at": _iso_now(),
+                "worker_sha": WORKER_SHA,
+            }).encode("utf-8"),
+            overwrite=True,
+            content_type="application/json",
+        )
+    except Exception as exc:  # pragma: no cover - the index must never fail a compile
+        log.warning("active-index write failed for %s: %s", job.compile_id, exc)
+
+
+def _clear_compile_active(blob_service: BlobServiceClient, job: "JobMessage") -> None:
+    """Take this compile out of the index, however it ended.
+
+    Called from a `finally`, and from the cancel path, and on the way out of a
+    watchdog kill -- every exit, because a marker left behind is a compile the
+    panel shows as running forever. The stale rule on the reading side is the
+    backstop for the exits nothing can catch, like SIGKILL.
+    """
+    try:
+        blob_service.get_blob_client(
+            container=BLOB_CONTAINER, blob=_active_index_path(job.compile_id),
+        ).delete_blob()
+    except Exception:
+        # Already gone is the normal case for a double-call, and a failure here
+        # must not mask whatever the compile was actually doing.
+        pass
+
+
 def _cancel_blob_path(deal_id: str) -> str:
     return f"deals/{deal_id}/orbitbrief/latest/compile-cancel.json"
 
@@ -374,6 +446,10 @@ class _CancelWatcher:
             # Nothing is holding a half-written artifact: envelope and atoms are
             # written at the end of a compile, and the progress file above is
             # already consistent.
+            try:
+                _clear_compile_active(self._blob_service, self._job)
+            except Exception:
+                pass
             _INFLIGHT.clear()
             time.sleep(0.1)
             os._exit(0)
@@ -498,6 +574,10 @@ def _release_inflight(reason: str) -> None:
         log.warning("Could not release queue lease on %s: %s", reason, exc)
     if job is None or blob_service is None:
         return
+    # Out of the index before anything else. This runs when a deploy kills the
+    # replica, which is the commonest way a marker would be orphaned -- and an
+    # orphan is a compile the panel shows as running forever.
+    _clear_compile_active(blob_service, job)
     try:
         blob_service.get_blob_client(
             container=BLOB_CONTAINER,
@@ -1374,6 +1454,9 @@ def _do_compile(
                 )
             except Exception as exc:  # pragma: no cover — best-effort UX
                 log.warning("compile-progress upload failed (%s %s): %s", phase, current_stage, exc)
+            # Same tick keeps the index entry fresh, so "stale" means the same
+            # thing to a reader whichever of the two it is looking at.
+            _mark_compile_active(blob_service, job, stage=current_stage)
 
         def _on_stage_end(stage, all_stages):  # type: ignore[no-untyped-def]
             _write_progress(stage.stage_name, all_stages, phase="completed")
@@ -1990,6 +2073,9 @@ def main() -> int:
     # Mark running
     _INFLIGHT["job"] = job
     _write_status(blob_service, job, "running", stage="starting", percent_complete=0)
+    # In the index from the moment work begins, so a reader never sees a gap
+    # between "the queue message is gone" and "something is running".
+    _mark_compile_active(blob_service, job, stage="starting")
 
     # Do the work
     try:
@@ -2037,6 +2123,10 @@ def main() -> int:
         try:
             result = _do_compile(job, manifest, blob_service)
         finally:
+            # However this ended -- done, raised, timed out -- it is no longer
+            # running, and a marker left behind is a compile the panel shows as
+            # running forever.
+            _clear_compile_active(blob_service, job)
             canceller.stop()
             watchdog.stop()
             renewer.stop()
