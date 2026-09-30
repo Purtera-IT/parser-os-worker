@@ -222,6 +222,162 @@ class _CompileWatchdog:
         os._exit(75)
 
 
+#: Where a request to stop a deal's running compile is written. One per deal,
+#: beside the progress file the panel already reads, so the same SAS and the
+#: same container serve both.
+def _cancel_blob_path(deal_id: str) -> str:
+    return f"deals/{deal_id}/orbitbrief/latest/compile-cancel.json"
+
+
+#: How often a running compile asks whether it has been told to stop.
+CANCEL_POLL_SEC = max(1.0, float(os.environ.get("SOWSMITH_CANCEL_POLL_SEC", "3") or 3))
+
+
+class _CancelWatcher:
+    """Stop a compile somebody has asked to stop, in seconds rather than stages.
+
+    A PM dragging a deal onto a busy slot means "run mine instead of that one",
+    and until this existed there was nothing that could honour it: nothing in
+    this worker read a cancel signal at all, and `cancelQueuedCompile` only
+    drains messages that have not started.
+
+    WHY A THREAD AND NOT THE STAGE CALLBACKS. The obvious hook is
+    ``stage_start_callback`` -- the worker already fires it around every stage.
+    But a cancel checked between stages is only as responsive as the longest
+    stage, and ``enrich_entities`` is 669 of 673 seconds on a models-on
+    compile. Somebody asking for their deal to jump the queue would wait up to
+    eleven minutes for the reply. That is not a cancel, it is a request.
+
+    So: a daemon thread on a short poll, and a hard exit. Blunt on purpose, and
+    the same shape as _CompileWatchdog above, which kills for the same reason.
+    Nothing under ``latest/`` is written mid-compile except the progress file
+    -- the envelope and atoms are written at the end -- so a compile killed
+    here leaves no half-finished artifact behind it.
+
+    Before exiting it does three things, in this order and all best-effort:
+    marks the deal cancelled so nobody sees a run that never ends, DELETES the
+    queue message so the cancelled compile is not redelivered and quietly run
+    again, and removes the request so it cannot cancel the next compile of the
+    same deal.
+    """
+
+    def __init__(
+        self,
+        blob_service: Any,
+        job: Any,
+        queue_client: Any,
+        msg: Any,
+        *,
+        poll_sec: float = CANCEL_POLL_SEC,
+    ) -> None:
+        self._blob_service = blob_service
+        self._job = job
+        self._q = queue_client
+        self._msg = msg
+        # The same path `_do_compile` writes its live progress to. Derived
+        # rather than passed, so this can be started beside the watchdog in the
+        # outer function where the queue message is still in scope.
+        self._progress_path = f"deals/{job.deal_id}/orbitbrief/latest/compile-progress.json"
+        self._started_iso = _iso_now()
+        self._poll = max(1.0, float(poll_sec))
+        self._done = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.fired = False
+
+    def start(self) -> "_CancelWatcher":
+        self._thread = threading.Thread(target=self._run, name="cancel-watcher", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._done.set()
+
+    def _request(self) -> dict[str, Any] | None:
+        """The cancel request for THIS compile, or None.
+
+        A request naming a different compile is not ours: the deal may have
+        been re-queued since, and cancelling the wrong run is worse than
+        cancelling none. A request naming no compile at all means "whatever is
+        running on this deal", which is what a slot on a dashboard means.
+        """
+        try:
+            blob = self._blob_service.get_blob_client(
+                container=BLOB_CONTAINER, blob=_cancel_blob_path(self._job.deal_id),
+            )
+            doc = json.loads(blob.download_blob().readall())
+        except Exception:
+            return None
+        if not isinstance(doc, dict):
+            return None
+        wanted = str(doc.get("compile_id") or "").strip()
+        if wanted and wanted != str(self._job.compile_id):
+            return None
+        return doc
+
+    def _run(self) -> None:
+        while not self._done.wait(self._poll):
+            req = self._request()
+            if req is None:
+                continue
+            self.fired = True
+            by = str(req.get("requested_by") or "?")
+            log.error(
+                "Compile cancelled by %s (deal=%s compile=%s). Freeing the slot now.",
+                by, self._job.deal_id, self._job.compile_id,
+            )
+            # 1. Say it on the deal, in BOTH places: parser-jobs/ is this
+            #    worker's own record, compile-progress.json is what the queue
+            #    panel reads. Only the second one frees the slot on screen.
+            try:
+                _write_status(
+                    self._blob_service, self._job, "cancelled",
+                    stage="cancelled", cancelled_by=by,
+                )
+            except Exception as exc:  # pragma: no cover - best effort before exit
+                log.error("Could not record the cancellation on the deal: %s", exc)
+            try:
+                self._blob_service.get_blob_client(
+                    container=BLOB_CONTAINER, blob=self._progress_path,
+                ).upload_blob(
+                    json.dumps({
+                        "compile_id": self._job.compile_id,
+                        "deal_id": self._job.deal_id,
+                        "status": "cancelled",
+                        "current_stage": None,
+                        "stages": [],
+                        "started_at": self._started_iso,
+                        "updated_at": _iso_now(),
+                        "cancelled_by": by,
+                        "worker_sha": WORKER_SHA,
+                        "parser_os_sha": PARSER_OS_SHA,
+                    }, indent=2).encode("utf-8"),
+                    overwrite=True,
+                    content_type="application/json",
+                )
+            except Exception as exc:  # pragma: no cover - best effort before exit
+                log.error("Could not mark compile-progress cancelled: %s", exc)
+            # 2. Drop the message. Without this the lease lapses and the
+            #    compile somebody just cancelled is redelivered and run again.
+            try:
+                _safe_delete_queue_message(self._q, self._msg, context="cancelled")
+            except Exception as exc:  # pragma: no cover - best effort before exit
+                log.error("Could not delete the cancelled message: %s", exc)
+            # 3. Remove the request, or it cancels this deal's NEXT compile
+            #    the moment one starts.
+            try:
+                self._blob_service.get_blob_client(
+                    container=BLOB_CONTAINER, blob=_cancel_blob_path(self._job.deal_id),
+                ).delete_blob()
+            except Exception:
+                pass
+            # Nothing is holding a half-written artifact: envelope and atoms are
+            # written at the end of a compile, and the progress file above is
+            # already consistent.
+            _INFLIGHT.clear()
+            time.sleep(0.1)
+            os._exit(0)
+
+
 class _LeaseRenewer:
     """Keep a dequeued message invisible for as long as its compile is running.
 
@@ -1826,9 +1982,14 @@ def main() -> int:
             COMPILE_TIMEOUT_SEC, COMPILE_SEC_PER_DOC,
         )
         watchdog = _CompileWatchdog(blob_service, job, budget).start()
+        # Somebody can ask for this compile to stop while it runs. Started here,
+        # beside the watchdog, because it needs the queue message: a cancelled
+        # compile whose message survives is simply run again a minute later.
+        canceller = _CancelWatcher(blob_service, job, queue_client, msg).start()
         try:
             result = _do_compile(job, manifest, blob_service)
         finally:
+            canceller.stop()
             watchdog.stop()
             renewer.stop()
             _INFLIGHT.pop("renewer", None)
