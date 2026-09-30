@@ -610,6 +610,32 @@ def _parse_queue_json(raw: str) -> dict[str, Any]:
     raise ValueError("Queue message decoded but was not a JSON object")
 
 
+def _who_asked(d: dict[str, Any]) -> str | None:
+    """Who asked for a compile, across both producers' shapes.
+
+    The PM queue panel sends a flat ``triggered_by``. parser-os-service sends
+    ``trigger: {"kind": "manual", "by": "griffin"}``. Reading only the first
+    leaves every service-initiated compile anonymous, and the service is what
+    auto-finalize goes through -- so that is most of them.
+
+    Empty becomes None, not "": a blank byline reads as "nobody" rather than
+    "we do not know".
+    """
+    flat = str(d.get("triggered_by") or d.get("triggeredBy") or "").strip()
+    if flat:
+        return flat
+    trig = d.get("trigger")
+    if isinstance(trig, dict):
+        by = str(trig.get("by") or "").strip()
+        if by:
+            return by
+        # A timer has no person behind it, and saying so is more useful than a
+        # blank -- "nobody asked for this" is the answer to "why is this here".
+        kind = str(trig.get("kind") or "").strip()
+        if kind:
+            return kind
+    return None
+
 @dataclass
 class JobMessage:
     compile_id: str
@@ -621,11 +647,17 @@ class JobMessage:
     # from a top-level `force` or compile_options.force so any caller can request
     # a forced re-parse; the timer-driven bulk floods never set it -> get deduped.
     force: bool = False
-    #: Who asked for this compile. The queue message has carried it all along --
-    #: every producer sets it -- and this class dropped it on the floor, so the
-    #: progress record could not say who started a run and the queue panel had
-    #: nothing to show against a compile once it stopped being a queued message.
+    #: Who asked for this compile, and what kind of thing asked.
+    #:
+    #: The message has carried this all along and this class dropped it. Two
+    #: producers, two shapes: the PM panel sets a flat ``triggered_by``, and
+    #: parser-os-service sets ``trigger: {"kind": ..., "by": ...}`` -- the
+    #: richer one, added precisely so a manual Re-parse and a four-hourly timer
+    #: stop being the same message. Reading only the flat field would have left
+    #: every service-initiated compile anonymous, which is most of them.
     triggered_by: str | None = None
+    #: "manual", "timer", … from the service. None when the producer did not say.
+    trigger_kind: str | None = None
 
     @classmethod
     def from_raw(cls, raw: str) -> "JobMessage":
@@ -638,8 +670,9 @@ class JobMessage:
             domain_pack=d.get("domain_pack"),
             compile_options=opts,
             force=bool(d.get("force") or opts.get("force")),
-            triggered_by=(
-                str(d.get("triggered_by") or d.get("triggeredBy") or "").strip() or None
+            triggered_by=_who_asked(d),
+            trigger_kind=(
+                str((d.get("trigger") or {}).get("kind") or "").strip() or None
             ),
         )
 
@@ -1325,6 +1358,7 @@ def _do_compile(
                 # Who asked for it. A running compile is no longer a queue
                 # message, so this record is the only place left that knows.
                 "triggered_by": job.triggered_by,
+                "trigger_kind": job.trigger_kind,
             }
             try:
                 blob_service.get_blob_client(
@@ -1369,6 +1403,7 @@ def _do_compile(
                     "worker_sha": WORKER_SHA,
                     "parser_os_sha": PARSER_OS_SHA,
                     "triggered_by": job.triggered_by,
+                    "trigger_kind": job.trigger_kind,
                 }, indent=2).encode("utf-8"),
                 overwrite=True,
                 content_type="application/json",
