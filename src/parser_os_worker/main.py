@@ -304,6 +304,12 @@ def _cancel_blob_path(deal_id: str) -> str:
 #: How often a running compile asks whether it has been told to stop.
 CANCEL_POLL_SEC = max(1.0, float(os.environ.get("SOWSMITH_CANCEL_POLL_SEC", "3") or 3))
 
+#: How often the progress document is re-written while a stage is still
+#: running. Four seconds: fast enough that a rate can be read off it within a
+#: few samples, slow enough that a long compile costs a few hundred small blob
+#: writes rather than thousands.
+PROGRESS_HEARTBEAT_SEC = max(1.0, float(os.environ.get("SOWSMITH_PROGRESS_HEARTBEAT_SEC", "4") or 4))
+
 
 class _CancelWatcher:
     """Stop a compile somebody has asked to stop, in seconds rather than stages.
@@ -1405,7 +1411,30 @@ def _do_compile(
         )
         progress_started_perf = time.time()
 
+        # The last thing the compile told us, so the heartbeat below can re-write
+        # the SAME document between stage boundaries instead of inventing a
+        # second one. One writer, one shape.
+        _last_seen: dict[str, Any] = {"stage": None, "stages": [], "phase": "running"}
+
+        def _stage_items() -> tuple[int, int]:
+            """How far through its own work the running stage says it is.
+
+            parser-os runs IN THIS PROCESS, so this reads the counter the
+            compile is updating on its own thread. (0, 0) when the stage does
+            not count -- most do not, and a made-up denominator is worse than
+            an honest silence.
+            """
+            try:
+                from app.core import telemetry as _t
+                return _t.stage_progress()
+            except Exception:
+                return (0, 0)
+
         def _write_progress(current_stage, all_stages, *, phase):  # type: ignore[no-untyped-def]
+            _last_seen["stage"] = current_stage
+            _last_seen["stages"] = all_stages
+            _last_seen["phase"] = phase
+            _items_done, _items_total = _stage_items()
             done = [
                 {
                     "stage_name": s.stage_name,
@@ -1439,6 +1468,18 @@ def _do_compile(
                 # message, so this record is the only place left that knows.
                 "triggered_by": job.triggered_by,
                 "trigger_kind": job.trigger_kind,
+                # HOW FAR THROUGH THE CURRENT STAGE.
+                #
+                # The median compile spends 47% of its wall clock inside its
+                # single longest stage, and this document was only ever written
+                # at stage boundaries -- so for about half of every compile
+                # there was nothing to see. Ten estimators fitted against that
+                # blindness topped out at 61% median error.
+                #
+                # With these two numbers the reader can measure a rate on THIS
+                # run and do arithmetic instead of extrapolating from a corpus.
+                "stage_items_done": _items_done,
+                "stage_items_total": _items_total,
             }
             try:
                 blob_service.get_blob_client(
@@ -1457,6 +1498,41 @@ def _do_compile(
             # Same tick keeps the index entry fresh, so "stale" means the same
             # thing to a reader whichever of the two it is looking at.
             _mark_compile_active(blob_service, job, stage=current_stage)
+
+        # RE-WRITE THE SAME DOCUMENT WHILE A STAGE IS STILL RUNNING.
+        #
+        # Stage callbacks fire at boundaries, and the long stages are where all
+        # the time goes -- typed_atom_classification is the longest stage in
+        # 44% of compiles and ran 18.7 minutes on one deal without a word. This
+        # thread re-writes the progress document on a short timer so the count
+        # inside that stage actually reaches anyone.
+        #
+        # It writes nothing until a stage has reported once: before that there
+        # is no shape to write, and an empty document would read as a compile
+        # with no stages rather than one that has not spoken yet.
+        _progress_stop = threading.Event()
+
+        def _progress_heartbeat() -> None:  # pragma: no cover - timing thread
+            while not _progress_stop.wait(PROGRESS_HEARTBEAT_SEC):
+                if _last_seen["stage"] is None:
+                    continue
+                try:
+                    _write_progress(
+                        _last_seen["stage"], _last_seen["stages"], phase=_last_seen["phase"],
+                    )
+                except Exception as exc:
+                    # Never let the heartbeat take a compile down; it is a
+                    # reporting nicety and the stage callbacks still fire.
+                    log.debug("progress heartbeat write failed: %s", exc)
+
+        threading.Thread(
+            target=_progress_heartbeat, name="progress-heartbeat", daemon=True,
+        ).start()
+        # Handed to the caller so its `finally` can stop this on EVERY exit.
+        # A heartbeat that outlives the compile re-writes "running" over the
+        # "done" this function is about to set, and the deal then shows as
+        # compiling forever -- with results already on disk.
+        _INFLIGHT["progress_stop"] = _progress_stop
 
         def _on_stage_end(stage, all_stages):  # type: ignore[no-untyped-def]
             _write_progress(stage.stage_name, all_stages, phase="completed")
@@ -2123,6 +2199,12 @@ def main() -> int:
         try:
             result = _do_compile(job, manifest, blob_service)
         finally:
+            # Stop the progress heartbeat FIRST. It re-writes the progress
+            # document on a timer, and one more tick after this point would
+            # overwrite the terminal status with a stale "running".
+            _ps = _INFLIGHT.pop("progress_stop", None)
+            if _ps is not None:
+                _ps.set()
             # However this ended -- done, raised, timed out -- it is no longer
             # running, and a marker left behind is a compile the panel shows as
             # running forever.
