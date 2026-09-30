@@ -116,3 +116,40 @@ def test_the_prefix_is_flat_and_separate_from_deal_data(job):
     # the 500-folder walk this exists to avoid.
     assert m._active_index_path("c1").startswith(m.ACTIVE_INDEX_PREFIX + "/")
     assert not m._active_index_path("c1").startswith("deals/")
+
+
+class TestTheProgressHeartbeatIsBounded:
+    """The heartbeat must not outlive the compile it reports on.
+
+    It re-writes the progress document on a timer so the count INSIDE a long
+    stage reaches the panel -- the median compile spends 47% of its wall clock
+    in one stage, and this document was only ever written at stage boundaries.
+
+    One tick after the compile ends would overwrite the terminal status with a
+    stale "running", and the deal would show as compiling forever with its
+    results already on disk. That is the same shape as the 45-minute stale
+    window and the orphaned index marker: a reporting thread telling the truth
+    about a moment that has passed.
+    """
+
+    def test_the_interval_is_short_enough_to_read_a_rate_from(self):
+        # A rate needs several samples inside one stage. At 4s a two-minute
+        # stage yields ~30 of them; at 30s it would yield four.
+        assert 1.0 <= m.PROGRESS_HEARTBEAT_SEC <= 10.0
+
+    def test_the_stop_event_is_published_for_the_caller(self, monkeypatch):
+        # The stop lives in _INFLIGHT precisely so the OUTER finally -- which
+        # already runs on every exit, including a raise and a timeout -- can
+        # end it without _do_compile needing its own try/finally.
+        import inspect
+        src = inspect.getsource(m)
+        assert '_INFLIGHT["progress_stop"] = _progress_stop' in src
+        assert '_ps = _INFLIGHT.pop("progress_stop", None)' in src
+
+    def test_stage_items_are_read_from_the_parser_in_this_process(self):
+        # parser-os runs in-process, so the worker reads the very counter the
+        # compile is updating on another thread. No IPC, no file, no guess.
+        import inspect
+        src = inspect.getsource(m)
+        assert "from app.core import telemetry as _t" in src
+        assert "_t.stage_progress()" in src
