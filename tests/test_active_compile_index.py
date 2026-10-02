@@ -143,7 +143,7 @@ class TestTheProgressHeartbeatIsBounded:
         # end it without _do_compile needing its own try/finally.
         import inspect
         src = inspect.getsource(m)
-        assert '_INFLIGHT["progress_stop"] = _progress_stop' in src
+        assert '_INFLIGHT["progress_stop"] = _progress_heartbeat' in src
         assert '_ps = _INFLIGHT.pop("progress_stop", None)' in src
 
     def test_stage_items_are_read_from_the_parser_in_this_process(self):
