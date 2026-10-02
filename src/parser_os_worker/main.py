@@ -311,6 +311,58 @@ CANCEL_POLL_SEC = max(1.0, float(os.environ.get("SOWSMITH_CANCEL_POLL_SEC", "3")
 PROGRESS_HEARTBEAT_SEC = max(1.0, float(os.environ.get("SOWSMITH_PROGRESS_HEARTBEAT_SEC", "4") or 4))
 
 
+class _ProgressHeartbeat:
+    """Re-writes the running compile's progress document on a timer, and can be
+    stopped for good.
+
+    The heartbeat repeats the LAST stage the compile reported. Once the parser
+    stages are done that is the final stage ("quality_gates"), and the worker
+    then writes "projection" and, after envelope.json is uploaded, "done". Live
+    010353 (compile b40e9bb3, 2026-10-02): the heartbeat was stopped only after
+    the whole job returned, so every tick re-wrote "running quality_gates" over
+    those writes, and the progress document stayed there from 14:26:41 -- the
+    moment envelope.json was written -- onward.
+
+    ``stop()`` takes the same lock a tick writes under, so when it returns no
+    tick is mid-write and none will follow: whatever is written next is last.
+    """
+
+    def __init__(self, write, interval: float) -> None:  # type: ignore[no-untyped-def]
+        self._write = write
+        self._interval = interval
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name="progress-heartbeat", daemon=True)
+
+    def start(self) -> "_ProgressHeartbeat":
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:  # pragma: no cover - timing thread
+        while not self._stop.wait(self._interval):
+            with self._lock:
+                if self._stop.is_set():
+                    return
+                try:
+                    self._write()
+                except Exception as exc:
+                    # Never let the heartbeat take a compile down; it is a
+                    # reporting nicety and the stage callbacks still fire.
+                    log.debug("progress heartbeat write failed: %s", exc)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop.set()
+
+    def set(self) -> None:
+        """Event-compatible alias: callers that held the old stop Event call set()."""
+        self.stop()
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop.is_set()
+
+
 class _CancelWatcher:
     """Stop a compile somebody has asked to stop, in seconds rather than stages.
 
@@ -1510,29 +1562,17 @@ def _do_compile(
         # It writes nothing until a stage has reported once: before that there
         # is no shape to write, and an empty document would read as a compile
         # with no stages rather than one that has not spoken yet.
-        _progress_stop = threading.Event()
+        def _heartbeat_tick() -> None:
+            if _last_seen["stage"] is None:
+                return
+            _write_progress(_last_seen["stage"], _last_seen["stages"], phase=_last_seen["phase"])
 
-        def _progress_heartbeat() -> None:  # pragma: no cover - timing thread
-            while not _progress_stop.wait(PROGRESS_HEARTBEAT_SEC):
-                if _last_seen["stage"] is None:
-                    continue
-                try:
-                    _write_progress(
-                        _last_seen["stage"], _last_seen["stages"], phase=_last_seen["phase"],
-                    )
-                except Exception as exc:
-                    # Never let the heartbeat take a compile down; it is a
-                    # reporting nicety and the stage callbacks still fire.
-                    log.debug("progress heartbeat write failed: %s", exc)
-
-        threading.Thread(
-            target=_progress_heartbeat, name="progress-heartbeat", daemon=True,
-        ).start()
+        _progress_heartbeat = _ProgressHeartbeat(_heartbeat_tick, PROGRESS_HEARTBEAT_SEC).start()
         # Handed to the caller so its `finally` can stop this on EVERY exit.
         # A heartbeat that outlives the compile re-writes "running" over the
         # "done" this function is about to set, and the deal then shows as
         # compiling forever -- with results already on disk.
-        _INFLIGHT["progress_stop"] = _progress_stop
+        _INFLIGHT["progress_stop"] = _progress_heartbeat
 
         def _on_stage_end(stage, all_stages):  # type: ignore[no-untyped-def]
             _write_progress(stage.stage_name, all_stages, phase="completed")
@@ -1587,6 +1627,10 @@ def _do_compile(
         )
         elapsed = time.time() - t0
         log.info("compile_project done in %.1fs", elapsed)
+        # The parser stages are over: stop re-writing the last one BEFORE the
+        # projection/done writes below, or a tick lands on top of them and the
+        # document reads "running quality_gates" after envelope.json exists.
+        _progress_heartbeat.stop()
 
         # v58: the parser STAGES are done — but build_orbitbrief_envelope()
         # below (the OrbitBrief projection: cockpit surfaces, facet sections,
