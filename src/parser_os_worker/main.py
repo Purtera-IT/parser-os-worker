@@ -218,8 +218,299 @@ class _CompileWatchdog:
             )
         except Exception as exc:  # pragma: no cover - best effort before exit
             log.error("Could not record the timeout on the deal: %s", exc)
+        try:
+            _clear_compile_active(self._blob_service, self._job)
+        except Exception:
+            pass
         time.sleep(0.1)
         os._exit(75)
+
+
+#: Where a request to stop a deal's running compile is written. One per deal,
+#: beside the progress file the panel already reads, so the same SAS and the
+#: same container serve both.
+#: One tiny blob per RUNNING compile, under a flat prefix.
+#:
+#: The queue panel used to answer "what is compiling?" by listing every deal
+#: folder and reading all ~500 progress documents. Measured against live dev
+#: that is 911ms just to list the folders, before a single read -- so the
+#: endpoint took 4-6s on a consumption plan and the panel polled at 2s against
+#: an answer it could not get in 2s.
+#:
+#: The worker already knows. It writes a marker when it starts and deletes it
+#: when it stops, so the reader lists ONE small prefix: 231ms for the listing
+#: and 122ms for four parallel reads, measured the same way.
+#:
+#: Named by compile id, not deal id: a deal can legitimately have two compiles
+#: in flight, and keying on the deal would have one silently erase the other.
+ACTIVE_INDEX_PREFIX = "_active-compiles"
+
+
+def _active_index_path(compile_id: str) -> str:
+    return f"{ACTIVE_INDEX_PREFIX}/{compile_id}.json"
+
+
+def _mark_compile_active(
+    blob_service: BlobServiceClient, job: "JobMessage", stage: str | None = None
+) -> None:
+    """Say, in one small blob, that this compile is running.
+
+    Best-effort on purpose. This is an INDEX, not the truth: the progress
+    document remains the record, and a reader that finds a marker still reads
+    the progress beside it. A marker that fails to write costs a compile its
+    place in a fast listing, not its existence -- the periodic full sweep on
+    the reading side still finds it.
+    """
+    try:
+        blob_service.get_blob_client(
+            container=BLOB_CONTAINER, blob=_active_index_path(job.compile_id),
+        ).upload_blob(
+            json.dumps({
+                "compile_id": job.compile_id,
+                "deal_id": job.deal_id,
+                "stage": stage,
+                "updated_at": _iso_now(),
+                "worker_sha": WORKER_SHA,
+            }).encode("utf-8"),
+            overwrite=True,
+            content_type="application/json",
+        )
+    except Exception as exc:  # pragma: no cover - the index must never fail a compile
+        log.warning("active-index write failed for %s: %s", job.compile_id, exc)
+
+
+def _clear_compile_active(blob_service: BlobServiceClient, job: "JobMessage") -> None:
+    """Take this compile out of the index, however it ended.
+
+    Called from a `finally`, and from the cancel path, and on the way out of a
+    watchdog kill -- every exit, because a marker left behind is a compile the
+    panel shows as running forever. The stale rule on the reading side is the
+    backstop for the exits nothing can catch, like SIGKILL.
+    """
+    try:
+        blob_service.get_blob_client(
+            container=BLOB_CONTAINER, blob=_active_index_path(job.compile_id),
+        ).delete_blob()
+    except Exception:
+        # Already gone is the normal case for a double-call, and a failure here
+        # must not mask whatever the compile was actually doing.
+        pass
+
+
+def _cancel_blob_path(deal_id: str) -> str:
+    return f"deals/{deal_id}/orbitbrief/latest/compile-cancel.json"
+
+
+#: How often a running compile asks whether it has been told to stop.
+CANCEL_POLL_SEC = max(1.0, float(os.environ.get("SOWSMITH_CANCEL_POLL_SEC", "3") or 3))
+
+#: How often the progress document is re-written while a stage is still
+#: running. Four seconds: fast enough that a rate can be read off it within a
+#: few samples, slow enough that a long compile costs a few hundred small blob
+#: writes rather than thousands.
+PROGRESS_HEARTBEAT_SEC = max(1.0, float(os.environ.get("SOWSMITH_PROGRESS_HEARTBEAT_SEC", "4") or 4))
+
+
+class _ProgressHeartbeat:
+    """Re-writes the running compile's progress document on a timer, and can be
+    stopped for good.
+
+    The heartbeat repeats the LAST stage the compile reported. Once the parser
+    stages are done that is the final stage ("quality_gates"), and the worker
+    then writes "projection" and, after envelope.json is uploaded, "done". Live
+    010353 (compile b40e9bb3, 2026-10-02): the heartbeat was stopped only after
+    the whole job returned, so every tick re-wrote "running quality_gates" over
+    those writes, and the progress document stayed there from 14:26:41 -- the
+    moment envelope.json was written -- onward.
+
+    ``stop()`` takes the same lock a tick writes under, so when it returns no
+    tick is mid-write and none will follow: whatever is written next is last.
+    """
+
+    def __init__(self, write, interval: float) -> None:  # type: ignore[no-untyped-def]
+        self._write = write
+        self._interval = interval
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name="progress-heartbeat", daemon=True)
+
+    def start(self) -> "_ProgressHeartbeat":
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:  # pragma: no cover - timing thread
+        while not self._stop.wait(self._interval):
+            with self._lock:
+                if self._stop.is_set():
+                    return
+                try:
+                    self._write()
+                except Exception as exc:
+                    # Never let the heartbeat take a compile down; it is a
+                    # reporting nicety and the stage callbacks still fire.
+                    log.debug("progress heartbeat write failed: %s", exc)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop.set()
+
+    def set(self) -> None:
+        """Event-compatible alias: callers that held the old stop Event call set()."""
+        self.stop()
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop.is_set()
+
+
+class _CancelWatcher:
+    """Stop a compile somebody has asked to stop, in seconds rather than stages.
+
+    A PM dragging a deal onto a busy slot means "run mine instead of that one",
+    and until this existed there was nothing that could honour it: nothing in
+    this worker read a cancel signal at all, and `cancelQueuedCompile` only
+    drains messages that have not started.
+
+    WHY A THREAD AND NOT THE STAGE CALLBACKS. The obvious hook is
+    ``stage_start_callback`` -- the worker already fires it around every stage.
+    But a cancel checked between stages is only as responsive as the longest
+    stage, and ``enrich_entities`` is 669 of 673 seconds on a models-on
+    compile. Somebody asking for their deal to jump the queue would wait up to
+    eleven minutes for the reply. That is not a cancel, it is a request.
+
+    So: a daemon thread on a short poll, and a hard exit. Blunt on purpose, and
+    the same shape as _CompileWatchdog above, which kills for the same reason.
+    Nothing under ``latest/`` is written mid-compile except the progress file
+    -- the envelope and atoms are written at the end -- so a compile killed
+    here leaves no half-finished artifact behind it.
+
+    Before exiting it does three things, in this order and all best-effort:
+    marks the deal cancelled so nobody sees a run that never ends, DELETES the
+    queue message so the cancelled compile is not redelivered and quietly run
+    again, and removes the request so it cannot cancel the next compile of the
+    same deal.
+    """
+
+    def __init__(
+        self,
+        blob_service: Any,
+        job: Any,
+        queue_client: Any,
+        msg: Any,
+        *,
+        poll_sec: float = CANCEL_POLL_SEC,
+    ) -> None:
+        self._blob_service = blob_service
+        self._job = job
+        self._q = queue_client
+        self._msg = msg
+        # The same path `_do_compile` writes its live progress to. Derived
+        # rather than passed, so this can be started beside the watchdog in the
+        # outer function where the queue message is still in scope.
+        self._progress_path = f"deals/{job.deal_id}/orbitbrief/latest/compile-progress.json"
+        self._started_iso = _iso_now()
+        self._poll = max(1.0, float(poll_sec))
+        self._done = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.fired = False
+
+    def start(self) -> "_CancelWatcher":
+        self._thread = threading.Thread(target=self._run, name="cancel-watcher", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._done.set()
+
+    def _request(self) -> dict[str, Any] | None:
+        """The cancel request for THIS compile, or None.
+
+        A request naming a different compile is not ours: the deal may have
+        been re-queued since, and cancelling the wrong run is worse than
+        cancelling none. A request naming no compile at all means "whatever is
+        running on this deal", which is what a slot on a dashboard means.
+        """
+        try:
+            blob = self._blob_service.get_blob_client(
+                container=BLOB_CONTAINER, blob=_cancel_blob_path(self._job.deal_id),
+            )
+            doc = json.loads(blob.download_blob().readall())
+        except Exception:
+            return None
+        if not isinstance(doc, dict):
+            return None
+        wanted = str(doc.get("compile_id") or "").strip()
+        if wanted and wanted != str(self._job.compile_id):
+            return None
+        return doc
+
+    def _run(self) -> None:
+        while not self._done.wait(self._poll):
+            req = self._request()
+            if req is None:
+                continue
+            self.fired = True
+            by = str(req.get("requested_by") or "?")
+            log.error(
+                "Compile cancelled by %s (deal=%s compile=%s). Freeing the slot now.",
+                by, self._job.deal_id, self._job.compile_id,
+            )
+            # 1. Say it on the deal, in BOTH places: parser-jobs/ is this
+            #    worker's own record, compile-progress.json is what the queue
+            #    panel reads. Only the second one frees the slot on screen.
+            try:
+                _write_status(
+                    self._blob_service, self._job, "cancelled",
+                    stage="cancelled", cancelled_by=by,
+                )
+            except Exception as exc:  # pragma: no cover - best effort before exit
+                log.error("Could not record the cancellation on the deal: %s", exc)
+            try:
+                self._blob_service.get_blob_client(
+                    container=BLOB_CONTAINER, blob=self._progress_path,
+                ).upload_blob(
+                    json.dumps({
+                        "compile_id": self._job.compile_id,
+                        "deal_id": self._job.deal_id,
+                        "status": "cancelled",
+                        "current_stage": None,
+                        "stages": [],
+                        "started_at": self._started_iso,
+                        "updated_at": _iso_now(),
+                        "cancelled_by": by,
+                        "triggered_by": self._job.triggered_by,
+                        "worker_sha": WORKER_SHA,
+                        "parser_os_sha": PARSER_OS_SHA,
+                    }, indent=2).encode("utf-8"),
+                    overwrite=True,
+                    content_type="application/json",
+                )
+            except Exception as exc:  # pragma: no cover - best effort before exit
+                log.error("Could not mark compile-progress cancelled: %s", exc)
+            # 2. Drop the message. Without this the lease lapses and the
+            #    compile somebody just cancelled is redelivered and run again.
+            try:
+                _safe_delete_queue_message(self._q, self._msg, context="cancelled")
+            except Exception as exc:  # pragma: no cover - best effort before exit
+                log.error("Could not delete the cancelled message: %s", exc)
+            # 3. Remove the request, or it cancels this deal's NEXT compile
+            #    the moment one starts.
+            try:
+                self._blob_service.get_blob_client(
+                    container=BLOB_CONTAINER, blob=_cancel_blob_path(self._job.deal_id),
+                ).delete_blob()
+            except Exception:
+                pass
+            # Nothing is holding a half-written artifact: envelope and atoms are
+            # written at the end of a compile, and the progress file above is
+            # already consistent.
+            try:
+                _clear_compile_active(self._blob_service, self._job)
+            except Exception:
+                pass
+            _INFLIGHT.clear()
+            time.sleep(0.1)
+            os._exit(0)
 
 
 class _LeaseRenewer:
@@ -341,6 +632,10 @@ def _release_inflight(reason: str) -> None:
         log.warning("Could not release queue lease on %s: %s", reason, exc)
     if job is None or blob_service is None:
         return
+    # Out of the index before anything else. This runs when a deploy kills the
+    # replica, which is the commonest way a marker would be orphaned -- and an
+    # orphan is a compile the panel shows as running forever.
+    _clear_compile_active(blob_service, job)
     try:
         blob_service.get_blob_client(
             container=BLOB_CONTAINER,
@@ -453,6 +748,32 @@ def _parse_queue_json(raw: str) -> dict[str, Any]:
     raise ValueError("Queue message decoded but was not a JSON object")
 
 
+def _who_asked(d: dict[str, Any]) -> str | None:
+    """Who asked for a compile, across both producers' shapes.
+
+    The PM queue panel sends a flat ``triggered_by``. parser-os-service sends
+    ``trigger: {"kind": "manual", "by": "griffin"}``. Reading only the first
+    leaves every service-initiated compile anonymous, and the service is what
+    auto-finalize goes through -- so that is most of them.
+
+    Empty becomes None, not "": a blank byline reads as "nobody" rather than
+    "we do not know".
+    """
+    flat = str(d.get("triggered_by") or d.get("triggeredBy") or "").strip()
+    if flat:
+        return flat
+    trig = d.get("trigger")
+    if isinstance(trig, dict):
+        by = str(trig.get("by") or "").strip()
+        if by:
+            return by
+        # A timer has no person behind it, and saying so is more useful than a
+        # blank -- "nobody asked for this" is the answer to "why is this here".
+        kind = str(trig.get("kind") or "").strip()
+        if kind:
+            return kind
+    return None
+
 @dataclass
 class JobMessage:
     compile_id: str
@@ -464,6 +785,17 @@ class JobMessage:
     # from a top-level `force` or compile_options.force so any caller can request
     # a forced re-parse; the timer-driven bulk floods never set it -> get deduped.
     force: bool = False
+    #: Who asked for this compile, and what kind of thing asked.
+    #:
+    #: The message has carried this all along and this class dropped it. Two
+    #: producers, two shapes: the PM panel sets a flat ``triggered_by``, and
+    #: parser-os-service sets ``trigger: {"kind": ..., "by": ...}`` -- the
+    #: richer one, added precisely so a manual Re-parse and a four-hourly timer
+    #: stop being the same message. Reading only the flat field would have left
+    #: every service-initiated compile anonymous, which is most of them.
+    triggered_by: str | None = None
+    #: "manual", "timer", … from the service. None when the producer did not say.
+    trigger_kind: str | None = None
 
     @classmethod
     def from_raw(cls, raw: str) -> "JobMessage":
@@ -476,6 +808,10 @@ class JobMessage:
             domain_pack=d.get("domain_pack"),
             compile_options=opts,
             force=bool(d.get("force") or opts.get("force")),
+            triggered_by=_who_asked(d),
+            trigger_kind=(
+                str((d.get("trigger") or {}).get("kind") or "").strip() or None
+            ),
         )
 
 
@@ -1182,7 +1518,30 @@ def _do_compile(
         )
         progress_started_perf = time.time()
 
+        # The last thing the compile told us, so the heartbeat below can re-write
+        # the SAME document between stage boundaries instead of inventing a
+        # second one. One writer, one shape.
+        _last_seen: dict[str, Any] = {"stage": None, "stages": [], "phase": "running"}
+
+        def _stage_items() -> tuple[int, int]:
+            """How far through its own work the running stage says it is.
+
+            parser-os runs IN THIS PROCESS, so this reads the counter the
+            compile is updating on its own thread. (0, 0) when the stage does
+            not count -- most do not, and a made-up denominator is worse than
+            an honest silence.
+            """
+            try:
+                from app.core import telemetry as _t
+                return _t.stage_progress()
+            except Exception:
+                return (0, 0)
+
         def _write_progress(current_stage, all_stages, *, phase):  # type: ignore[no-untyped-def]
+            _last_seen["stage"] = current_stage
+            _last_seen["stages"] = all_stages
+            _last_seen["phase"] = phase
+            _items_done, _items_total = _stage_items()
             done = [
                 {
                     "stage_name": s.stage_name,
@@ -1212,6 +1571,22 @@ def _do_compile(
                 ),
                 "worker_sha": WORKER_SHA,
                 "parser_os_sha": PARSER_OS_SHA,
+                # Who asked for it. A running compile is no longer a queue
+                # message, so this record is the only place left that knows.
+                "triggered_by": job.triggered_by,
+                "trigger_kind": job.trigger_kind,
+                # HOW FAR THROUGH THE CURRENT STAGE.
+                #
+                # The median compile spends 47% of its wall clock inside its
+                # single longest stage, and this document was only ever written
+                # at stage boundaries -- so for about half of every compile
+                # there was nothing to see. Ten estimators fitted against that
+                # blindness topped out at 61% median error.
+                #
+                # With these two numbers the reader can measure a rate on THIS
+                # run and do arithmetic instead of extrapolating from a corpus.
+                "stage_items_done": _items_done,
+                "stage_items_total": _items_total,
             }
             try:
                 blob_service.get_blob_client(
@@ -1227,6 +1602,32 @@ def _do_compile(
                 )
             except Exception as exc:  # pragma: no cover — best-effort UX
                 log.warning("compile-progress upload failed (%s %s): %s", phase, current_stage, exc)
+            # Same tick keeps the index entry fresh, so "stale" means the same
+            # thing to a reader whichever of the two it is looking at.
+            _mark_compile_active(blob_service, job, stage=current_stage)
+
+        # RE-WRITE THE SAME DOCUMENT WHILE A STAGE IS STILL RUNNING.
+        #
+        # Stage callbacks fire at boundaries, and the long stages are where all
+        # the time goes -- typed_atom_classification is the longest stage in
+        # 44% of compiles and ran 18.7 minutes on one deal without a word. This
+        # thread re-writes the progress document on a short timer so the count
+        # inside that stage actually reaches anyone.
+        #
+        # It writes nothing until a stage has reported once: before that there
+        # is no shape to write, and an empty document would read as a compile
+        # with no stages rather than one that has not spoken yet.
+        def _heartbeat_tick() -> None:
+            if _last_seen["stage"] is None:
+                return
+            _write_progress(_last_seen["stage"], _last_seen["stages"], phase=_last_seen["phase"])
+
+        _progress_heartbeat = _ProgressHeartbeat(_heartbeat_tick, PROGRESS_HEARTBEAT_SEC).start()
+        # Handed to the caller so its `finally` can stop this on EVERY exit.
+        # A heartbeat that outlives the compile re-writes "running" over the
+        # "done" this function is about to set, and the deal then shows as
+        # compiling forever -- with results already on disk.
+        _INFLIGHT["progress_stop"] = _progress_heartbeat
 
         def _on_stage_end(stage, all_stages):  # type: ignore[no-untyped-def]
             _write_progress(stage.stage_name, all_stages, phase="completed")
@@ -1255,6 +1656,8 @@ def _do_compile(
                     "elapsed_ms": 0,
                     "worker_sha": WORKER_SHA,
                     "parser_os_sha": PARSER_OS_SHA,
+                    "triggered_by": job.triggered_by,
+                    "trigger_kind": job.trigger_kind,
                 }, indent=2).encode("utf-8"),
                 overwrite=True,
                 content_type="application/json",
@@ -1279,6 +1682,10 @@ def _do_compile(
         )
         elapsed = time.time() - t0
         log.info("compile_project done in %.1fs", elapsed)
+        # The parser stages are over: stop re-writing the last one BEFORE the
+        # projection/done writes below, or a tick lands on top of them and the
+        # document reads "running quality_gates" after envelope.json exists.
+        _progress_heartbeat.stop()
 
         # v58: the parser STAGES are done — but build_orbitbrief_envelope()
         # below (the OrbitBrief projection: cockpit surfaces, facet sections,
@@ -1841,6 +2248,9 @@ def main() -> int:
     # Mark running
     _INFLIGHT["job"] = job
     _write_status(blob_service, job, "running", stage="starting", percent_complete=0)
+    # In the index from the moment work begins, so a reader never sees a gap
+    # between "the queue message is gone" and "something is running".
+    _mark_compile_active(blob_service, job, stage="starting")
 
     # Do the work
     try:
@@ -1881,9 +2291,24 @@ def main() -> int:
             COMPILE_TIMEOUT_SEC, COMPILE_SEC_PER_DOC,
         )
         watchdog = _CompileWatchdog(blob_service, job, budget).start()
+        # Somebody can ask for this compile to stop while it runs. Started here,
+        # beside the watchdog, because it needs the queue message: a cancelled
+        # compile whose message survives is simply run again a minute later.
+        canceller = _CancelWatcher(blob_service, job, queue_client, msg).start()
         try:
             result = _do_compile(job, manifest, blob_service)
         finally:
+            # Stop the progress heartbeat FIRST. It re-writes the progress
+            # document on a timer, and one more tick after this point would
+            # overwrite the terminal status with a stale "running".
+            _ps = _INFLIGHT.pop("progress_stop", None)
+            if _ps is not None:
+                _ps.set()
+            # However this ended -- done, raised, timed out -- it is no longer
+            # running, and a marker left behind is a compile the panel shows as
+            # running forever.
+            _clear_compile_active(blob_service, job)
+            canceller.stop()
             watchdog.stop()
             renewer.stop()
             _INFLIGHT.pop("renewer", None)
