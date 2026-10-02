@@ -851,6 +851,59 @@ def _previous_attempt_timed_out(blob_service: BlobServiceClient, job: JobMessage
     return str(prev.get("status") or "") == "failed" and str(prev.get("stage") or "") == "timeout"
 
 
+# A durable, findable record of every compile's outcome. The per-compile status
+# blob above sits under its deal, so reading "every compile this week" meant
+# listing every deal; and compile-progress.json is one file per deal that the
+# next compile overwrites. On a final status the worker also writes a small
+# entry under a date prefix, with the facts a reader needs in blob metadata, so
+# PM Console › Admin › Models can list a day without downloading anything.
+# The traceback stays in the per-deal blob; the index carries a short error.
+RUN_INDEX_PREFIX = "_parser-runs"
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "interrupted"})
+_RUN_INDEX_FIELDS = (
+    "compile_id", "deal_id", "status", "stage", "updated_at", "worker_sha",
+    "parser_os_sha", "elapsed_sec", "entity_count", "atom_count", "percent_complete",
+)
+_RUN_INDEX_ERROR_MAX = 500
+
+
+def _run_index_blob_path(compile_id: str, updated_at: str) -> str:
+    return f"{RUN_INDEX_PREFIX}/{updated_at[:10]}/{compile_id}.json"
+
+
+def _metadata_value(value: Any, limit: int = 128) -> str:
+    """Blob metadata travels as HTTP headers: printable ASCII only, kept short."""
+    text = "" if value is None else str(value)
+    return "".join(ch for ch in text if 32 <= ord(ch) < 127)[:limit]
+
+
+def _run_index_metadata(payload: dict[str, Any]) -> dict[str, str]:
+    keys = ("status", "stage", "deal_id", "compile_id", "updated_at", "elapsed_sec", "worker_sha")
+    out = {k: _metadata_value(payload.get(k)) for k in keys}
+    return {k: v for k, v in out.items() if v}
+
+
+def _write_run_index(blob_service: BlobServiceClient, payload: dict[str, Any]) -> None:
+    """Best effort: a failed index write is logged, never raised."""
+    try:
+        body = {k: payload[k] for k in _RUN_INDEX_FIELDS if k in payload}
+        err = payload.get("error")
+        if err:
+            text = str(err)
+            body["error"] = text if len(text) <= _RUN_INDEX_ERROR_MAX else text[: _RUN_INDEX_ERROR_MAX - 1] + "…"
+        blob_service.get_blob_client(
+            container=BLOB_CONTAINER,
+            blob=_run_index_blob_path(str(payload["compile_id"]), str(payload["updated_at"])),
+        ).upload_blob(
+            json.dumps(body, indent=2, default=str),
+            overwrite=True,
+            content_type="application/json",
+            metadata=_run_index_metadata(payload),
+        )
+    except Exception as exc:  # never let the index kill the worker
+        log.warning("Failed to write run index: %s", exc)
+
+
 def _write_status(
     blob_service: BlobServiceClient,
     job: JobMessage,
@@ -877,6 +930,8 @@ def _write_status(
         )
     except Exception as exc:  # never let status writes kill the worker
         log.warning("Failed to write status blob: %s", exc)
+    if status in _TERMINAL_STATUSES:
+        _write_run_index(blob_service, payload)
 
 
 # ─── Manifest + envelope read/write ───────────────────────────────────────
