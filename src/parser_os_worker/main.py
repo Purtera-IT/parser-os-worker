@@ -218,7 +218,14 @@ class _CompileWatchdog:
             )
         except Exception as exc:  # pragma: no cover - best effort before exit
             log.error("Could not record the timeout on the deal: %s", exc)
+        # The page reads compile-progress.json, not the status above. Without
+        # this a timed-out compile showed "running" until someone cleared it.
+        _fail_progress_if_ours(
+            self._blob_service, self._job, stage="timeout",
+            error=f"The parse ran past its {self._timeout / 60:.0f}-minute limit and was stopped.",
+        )
         try:
+            _delete_keepalive(_INFLIGHT.get("keepalive"))
             _clear_compile_active(self._blob_service, self._job)
         except Exception:
             pass
@@ -271,6 +278,11 @@ def _mark_compile_active(
                 "stage": stage,
                 "updated_at": _iso_now(),
                 "worker_sha": WORKER_SHA,
+                # Which process is doing it, so a restarted container can
+                # recognise its predecessor's runs (see recover_dead_runs).
+                "replica": _REPLICA,
+                "boot_id": _BOOT_ID,
+                "keepalive": _INFLIGHT.get("keepalive"),
             }).encode("utf-8"),
             overwrite=True,
             content_type="application/json",
@@ -295,6 +307,363 @@ def _clear_compile_active(blob_service: BlobServiceClient, job: "JobMessage") ->
         # Already gone is the normal case for a double-call, and a failure here
         # must not mask whatever the compile was actually doing.
         pass
+
+
+# ─── Runs that die without a word ─────────────────────────────────────────
+#
+# A compile killed by the kernel for memory (exit 137) runs no Python: no
+# `except`, no `finally`, no signal handler. Deal 010264 died that way three
+# times on 2026-10-13 and every time the same three things followed. The deal's
+# compile-progress.json stayed "running", so the page greyed out Re-parse and
+# Clear until someone edited the blob by hand. The queue handed the message back
+# half an hour later and the same compile died the same way. And after the third
+# try the poison forward failed ("Queue already exists"), so the job was dropped
+# with the page still waiting on it.
+#
+# What follows makes each of those impossible to repeat silently:
+#   * every process has a boot id, and the active-compile marker records the
+#     replica and boot that wrote it. A container restarted in the same replica
+#     after a kill finds its predecessor's markers at startup and marks those
+#     runs failed at once (`recover_dead_runs`);
+#   * a memory guard stops the compile itself, with a clear "out of memory"
+#     failure, before the kernel kills it without one (`_MemoryGuard`);
+#   * a compile that was killed or ran out of memory is not re-run from the
+#     queue: it goes to the poison queue with the deal already showing why;
+#   * every path that gives up on a message also fails the deal's progress
+#     document, but only while that document still belongs to this compile.
+
+#: Who this process is. The replica name survives a container restart (the
+#: replica is the same pod); the boot id does not, which is how a restarted
+#: container tells its own dead runs from runs another replica is doing now.
+_REPLICA = (
+    os.environ.get("CONTAINER_APP_REPLICA_NAME")
+    or os.environ.get("HOSTNAME")
+    or "unknown-replica"
+)
+_BOOT_ID = f"{os.getpid()}-{time.time_ns()}"
+
+#: Final per-compile stages after which re-running the same message would only
+#: fail the same way: it outran its budget, or it was killed for memory.
+_DO_NOT_RERUN_STAGES = frozenset({"timeout", "killed", "out_of_memory"})
+
+
+def _progress_blob_path(deal_id: str) -> str:
+    return f"deals/{deal_id}/orbitbrief/latest/compile-progress.json"
+
+
+def _fail_progress_if_ours(
+    blob_service: Any,
+    job: Any,
+    *,
+    stage: str,
+    error: str,
+    status: str = "failed",
+) -> bool:
+    """Put the deal's progress document in a terminal state for THIS compile.
+
+    Only when the document is this compile's own, or there is none: a user who
+    already pressed Re-parse has a newer compile writing there, and failing it
+    because an older message was given up on would be the same bug backwards.
+    The write is conditional on the version just read, so a newer compile that
+    starts between the read and the write wins. Best effort; never raises.
+    Returns True when the document was written.
+    """
+    try:
+        from azure.core import MatchConditions
+        from azure.core.exceptions import ResourceNotFoundError
+
+        client = blob_service.get_blob_client(
+            container=BLOB_CONTAINER, blob=_progress_blob_path(job.deal_id),
+        )
+        current: dict[str, Any] = {}
+        etag = None
+        try:
+            downloader = client.download_blob()
+            raw = downloader.readall()
+            etag = getattr(getattr(downloader, "properties", None), "etag", None)
+            parsed = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace"))
+            current = parsed if isinstance(parsed, dict) else {}
+        except ResourceNotFoundError:
+            current = {}
+        if current and current.get("compile_id") not in (None, job.compile_id):
+            log.info(
+                "Not failing compile-progress for deal %s: it now belongs to compile %s, not %s",
+                job.deal_id, current.get("compile_id"), job.compile_id,
+            )
+            return False
+        payload = {
+            **{k: v for k, v in current.items() if k in ("stages", "started_at", "stage_count_done",
+                                                          "stage_count_total_estimate", "triggered_by",
+                                                          "trigger_kind", "stage_items_done",
+                                                          "stage_items_total")},
+            "compile_id": job.compile_id,
+            "deal_id": job.deal_id,
+            "status": status,
+            "current_stage": None,
+            "failed_stage": current.get("current_stage") or stage,
+            "stage": stage,
+            "updated_at": _iso_now(),
+            "error": error[:500],
+            "worker_sha": WORKER_SHA,
+            "parser_os_sha": PARSER_OS_SHA,
+        }
+        kwargs: dict[str, Any] = {"overwrite": True, "content_type": "application/json"}
+        if etag:
+            kwargs.update(etag=etag, match_condition=MatchConditions.IfNotModified)
+        client.upload_blob(json.dumps(payload, indent=2, default=str).encode("utf-8"), **kwargs)
+        return True
+    except Exception as exc:  # the deal's display must never fail the worker
+        log.warning("Could not fail compile-progress for %s/%s: %s", job.deal_id, job.compile_id, exc)
+        return False
+
+
+def _killed_run_message(stage: str | None, done: Any, total: Any) -> str:
+    where = f" in {stage}" if stage else ""
+    try:
+        if int(total) > 0:
+            where += f" at {int(done):,} of {int(total):,} items"
+    except (TypeError, ValueError):
+        pass
+    return (
+        f"The parser worker was killed mid-run{where}, most likely for running out of memory. "
+        "Nothing was saved from this run; press Re-parse to try again."
+    )
+
+
+def recover_dead_runs(blob_service: Any, queue_service: Any = None) -> int:
+    """Fail, right away, the runs a previous boot of THIS replica left running.
+
+    Called once when a process starts. A marker from this replica with a
+    different boot id can only be a run that died with the old process, because
+    one replica runs one process. Markers from other replicas are left to them
+    (and to the reader's stale rule if those died too). Returns how many runs
+    were failed. Never raises.
+    """
+    failed = 0
+    try:
+        container = blob_service.get_container_client(BLOB_CONTAINER)
+        blobs = list(container.list_blobs(name_starts_with=f"{ACTIVE_INDEX_PREFIX}/"))
+    except Exception as exc:
+        log.warning("Dead-run recovery could not list %s: %s", ACTIVE_INDEX_PREFIX, exc)
+        return 0
+    for item in blobs:
+        name = getattr(item, "name", None) or (item.get("name") if isinstance(item, dict) else None)
+        if not name:
+            continue
+        try:
+            raw = blob_service.get_blob_client(container=BLOB_CONTAINER, blob=name).download_blob().readall()
+            marker = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        if not isinstance(marker, dict):
+            continue
+        if marker.get("replica") != _REPLICA or not marker.get("boot_id") or marker.get("boot_id") == _BOOT_ID:
+            continue
+        compile_id, deal_id = marker.get("compile_id"), marker.get("deal_id")
+        if not compile_id or not deal_id:
+            continue
+        job = SimpleJob(deal_id=str(deal_id), compile_id=str(compile_id))
+        progress = _read_progress(blob_service, job.deal_id)
+        error = _killed_run_message(
+            marker.get("stage") or (progress or {}).get("current_stage"),
+            (progress or {}).get("stage_items_done"),
+            (progress or {}).get("stage_items_total"),
+        )
+        log.error("Recovering dead run deal=%s compile=%s: %s", deal_id, compile_id, error)
+        _fail_progress_if_ours(blob_service, job, stage="killed", error=error)
+        _write_status(blob_service, job, "failed", stage="killed", error=error)
+        _delete_keepalive(marker.get("keepalive"), queue_service)
+        _clear_compile_active(blob_service, job)
+        failed += 1
+    return failed
+
+
+@dataclass
+class SimpleJob:
+    """The two ids the status writers need, for a run known only by its marker."""
+
+    deal_id: str
+    compile_id: str
+
+
+def _read_progress(blob_service: Any, deal_id: str) -> dict[str, Any] | None:
+    try:
+        raw = blob_service.get_blob_client(
+            container=BLOB_CONTAINER, blob=_progress_blob_path(deal_id),
+        ).download_blob().readall()
+        parsed = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace"))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+# ─── Memory guard ─────────────────────────────────────────────────────────
+
+#: Stop the compile when this process holds this fraction of the container's
+#: memory limit. 0 turns the guard off.
+MEMORY_GUARD_FRACTION = float(os.environ.get("SOWSMITH_MEMORY_GUARD_FRACTION", "0.9") or 0)
+MEMORY_GUARD_POLL_SEC = max(0.5, float(os.environ.get("SOWSMITH_MEMORY_GUARD_POLL_SEC", "2") or 2))
+
+
+def _container_memory_limit_bytes() -> int | None:
+    """The cgroup memory limit (v2, then v1), or None when there is none."""
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            text = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if not text or text == "max":
+            return None
+        try:
+            value = int(text)
+        except ValueError:
+            continue
+        # cgroup v1 reports "no limit" as a huge page-aligned number.
+        return value if 0 < value < (1 << 60) else None
+    return None
+
+
+def _process_rss_bytes() -> int:
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+class _MemoryGuard:
+    """End a compile that is about to be killed for memory, and say so.
+
+    The kernel's OOM kill is silent: exit 137, nothing written, a deal stuck at
+    "running". This thread watches the process's own resident memory against
+    the container's limit and, past ``MEMORY_GUARD_FRACTION``, records the
+    failure with the stage and item count it reached, then exits. The message
+    is not re-run (see ``_DO_NOT_RERUN_STAGES``): the same compile on the same
+    worker would reach the same size.
+    """
+
+    def __init__(
+        self,
+        blob_service: Any,
+        job: Any,
+        *,
+        limit_bytes: int | None = None,
+        fraction: float = MEMORY_GUARD_FRACTION,
+        poll_sec: float = MEMORY_GUARD_POLL_SEC,
+        rss=_process_rss_bytes,  # type: ignore[no-untyped-def]
+    ) -> None:
+        self._blob_service = blob_service
+        self._job = job
+        self._limit = limit_bytes if limit_bytes is not None else _container_memory_limit_bytes()
+        self._fraction = fraction
+        self._poll = poll_sec
+        self._rss = rss
+        self._done = threading.Event()
+        self.fired = False
+
+    def start(self) -> "_MemoryGuard":
+        if not self._limit or self._fraction <= 0:
+            log.info("Memory guard off (limit=%s fraction=%s)", self._limit, self._fraction)
+            return self
+        threading.Thread(target=self._run, name="memory-guard", daemon=True).start()
+        return self
+
+    def stop(self) -> None:
+        self._done.set()
+
+    def _run(self) -> None:
+        ceiling = self._limit * self._fraction
+        while not self._done.wait(self._poll):
+            used = self._rss()
+            if used < ceiling:
+                continue
+            self.fired = True
+            try:
+                from app.core import telemetry as _t
+                done, total = _t.stage_progress()
+            except Exception:
+                done, total = 0, 0
+            stage = (_read_progress(self._blob_service, self._job.deal_id) or {}).get("current_stage")
+            where = f" in {stage}" if stage else ""
+            if total:
+                where += f" at {done:,} of {total:,} items"
+            error = (
+                f"The parse ran out of memory{where}: {used / 2**30:.1f} GB used of the worker's "
+                f"{self._limit / 2**30:.1f} GB. Nothing was saved from this run."
+            )
+            log.error("Memory guard: %s (deal=%s compile=%s)", error, self._job.deal_id, self._job.compile_id)
+            try:
+                _fail_progress_if_ours(self._blob_service, self._job, stage="out_of_memory", error=error)
+                _write_status(self._blob_service, self._job, "failed", stage="out_of_memory", error=error)
+            except Exception:
+                pass
+            try:
+                _delete_keepalive(_INFLIGHT.get("keepalive"))
+                _clear_compile_active(self._blob_service, self._job)
+            except Exception:
+                pass
+            time.sleep(0.1)
+            os._exit(75)
+
+
+# ─── Keep a replica up while a compile runs ───────────────────────────────
+#
+# The warm worker scales on queue length, and KEDA's azure-queue scaler counts
+# VISIBLE messages. A compile takes its message off the queue (invisible) when
+# it starts, so for the scaler a queue with one long compile in flight is an
+# empty queue, and after the cooldown it scales the replica to zero -- SIGTERM
+# mid-run. 010264 died that way at 12:10 on 2026-10-13, 4,283 items in.
+#
+# While a compile runs, the worker keeps one visible message in a separate
+# in-flight queue and deletes it when the compile ends. A scale rule on that
+# queue (queueLength 1) then holds one replica per running compile. The
+# message carries a TTL as a backstop, and a dead run's message is deleted by
+# `recover_dead_runs`. Off until AZURE_STORAGE_QUEUE_INFLIGHT names the queue,
+# because it does nothing without the scale rule (see README).
+INFLIGHT_QUEUE_NAME = os.environ.get("AZURE_STORAGE_QUEUE_INFLIGHT", "").strip()
+_KEEPALIVE_CLIENT: dict[str, Any] = {}
+
+
+def _send_keepalive(queue_service: Any, job: Any) -> dict[str, Any] | None:
+    if not INFLIGHT_QUEUE_NAME:
+        return None
+    try:
+        from azure.core.exceptions import ResourceExistsError
+
+        qc = queue_service.get_queue_client(INFLIGHT_QUEUE_NAME)
+        try:
+            qc.create_queue()
+        except ResourceExistsError:
+            pass
+        sent = qc.send_message(
+            json.dumps({"compile_id": job.compile_id, "deal_id": job.deal_id, "replica": _REPLICA}),
+            time_to_live=int(LEASE_MAX_SEC),
+        )
+        _KEEPALIVE_CLIENT["client"] = qc
+        return {"id": getattr(sent, "id", None), "pop_receipt": getattr(sent, "pop_receipt", None)}
+    except Exception as exc:
+        log.warning("In-flight keepalive not sent (scale-to-zero may interrupt this compile): %s", exc)
+        return None
+
+
+def _delete_keepalive(keepalive: Any, queue_service: Any = None) -> None:
+    if not keepalive or not isinstance(keepalive, dict) or not keepalive.get("id"):
+        return
+    qc = _KEEPALIVE_CLIENT.get("client")
+    if qc is None and queue_service is not None and INFLIGHT_QUEUE_NAME:
+        try:
+            qc = queue_service.get_queue_client(INFLIGHT_QUEUE_NAME)
+        except Exception:
+            qc = None
+    if qc is None:
+        return
+    try:
+        qc.delete_message(keepalive["id"], keepalive.get("pop_receipt"))
+    except Exception as exc:
+        if not _is_benign_queue_delete_error(exc):
+            log.warning("In-flight keepalive delete failed: %s", exc)
 
 
 def _cancel_blob_path(deal_id: str) -> str:
@@ -620,6 +989,7 @@ def _release_inflight(reason: str) -> None:
             renewer.stop()
     except Exception:
         pass
+    _delete_keepalive(st.get("keepalive"))
     try:
         queue_client.update_message(
             msg, pop_receipt=getattr(msg, "pop_receipt", None), visibility_timeout=0,
@@ -851,6 +1221,24 @@ def _previous_attempt_timed_out(blob_service: BlobServiceClient, job: JobMessage
     return str(prev.get("status") or "") == "failed" and str(prev.get("stage") or "") == "timeout"
 
 
+def _previous_attempt_cannot_succeed(blob_service: BlobServiceClient, job: JobMessage) -> str | None:
+    """The final stage of an earlier attempt that re-running would only repeat.
+
+    ``timeout`` (see above), and ``killed`` / ``out_of_memory``: a compile the
+    kernel or the memory guard stopped will reach the same size on the same
+    worker. Deal 010264 was run three times to the same out-of-memory kill,
+    half an hour apart, before the message was dropped. The deal already shows
+    the failure; the user re-parses when something has changed.
+    """
+    prev = _read_status(blob_service, job)
+    if not prev or prev.get("compile_id") != job.compile_id:
+        return None
+    stage = str(prev.get("stage") or "")
+    if str(prev.get("status") or "") == "failed" and stage in _DO_NOT_RERUN_STAGES:
+        return stage
+    return None
+
+
 # A durable, findable record of every compile's outcome. The per-compile status
 # blob above sits under its deal, so reading "every compile this week" meant
 # listing every deal; and compile-progress.json is one file per deal that the
@@ -1030,7 +1418,15 @@ def _forward_to_poison_queue(
             POISON_QUEUE_NAME,
             message_encode_policy=TextBase64EncodePolicy(),
         )
-        pqc.create_queue()
+        # create_queue raises when the queue is already there, which after the
+        # first poison message is always. That exception skipped the send, so
+        # every exhausted message after the first was dropped, not archived.
+        from azure.core.exceptions import ResourceExistsError
+
+        try:
+            pqc.create_queue()
+        except ResourceExistsError:
+            pass
         doc = {
             "reason": reason,
             "dequeue_count": dequeue_count,
@@ -1998,6 +2394,10 @@ def _assert_tmp_has_space(min_free_bytes: int) -> None:
 from parser_os_worker.drain import drain_requested
 
 
+#: Set once this process has looked for its predecessor's dead runs.
+_RECOVERY_DONE: list[bool] = []
+
+
 def main() -> int:
     log.info(
         "parser-os-worker starting (worker_sha=%s parser_os_sha=%s)",
@@ -2039,6 +2439,15 @@ def main() -> int:
             account_url=f"https://{ACCOUNT_NAME}.blob.core.windows.net",
             credential=cred,
         )
+    # A container that restarted after a kill finds its predecessor's runs and
+    # fails them now, so the deal stops showing "running" within seconds of the
+    # restart instead of until someone edits the blob. Once per process.
+    if not _RECOVERY_DONE:
+        _RECOVERY_DONE.append(True)
+        n = recover_dead_runs(blob_service, queue_service)
+        if n:
+            log.error("Failed %d run(s) left running by a previous boot of replica %s", n, _REPLICA)
+
     # ── drain gate ───────────────────────────────────────────────────────
     #
     # Rolling this Container App restarts it, killing whatever compile it is
@@ -2202,6 +2611,13 @@ def main() -> int:
             stage="exhausted_retries",
             error=f"dequeue_count {msg.dequeue_count} > {MAX_DEQUEUE_COUNT}",
         )
+        # The page waits on compile-progress.json, not the status above. Giving
+        # up on the message without saying so there is what left 010264's page
+        # waiting on a job that no longer existed.
+        _fail_progress_if_ours(
+            blob_service, job, stage="exhausted_retries",
+            error=f"The parse failed {msg.dequeue_count - 1} times and was not retried again. Press Re-parse to try again.",
+        )
         _forward_to_poison_queue(
             queue_service,
             raw_message=raw if isinstance(raw, str) else str(raw),
@@ -2215,20 +2631,30 @@ def main() -> int:
 
     # A compile that already ran out of its budget once is not run again: it
     # would hold a replica for the full budget and die the same way.
-    if msg.dequeue_count > 1 and _previous_attempt_timed_out(blob_service, job):
+    _prev_final = _previous_attempt_cannot_succeed(blob_service, job) if msg.dequeue_count > 1 else None
+    if _prev_final:
         log.error(
-            "Compile %s for deal %s timed out on an earlier attempt (dequeue %d); forwarding to poison instead of re-running.",
-            job.compile_id, job.deal_id, msg.dequeue_count,
+            "Compile %s for deal %s ended %r on an earlier attempt (dequeue %d); forwarding to poison instead of re-running.",
+            job.compile_id, job.deal_id, _prev_final, msg.dequeue_count,
         )
+        _prev_error = {
+            "timeout": "compile exceeded COMPILE_TIMEOUT_SEC on an earlier attempt",
+            "killed": "the worker was killed mid-run on an earlier attempt",
+            "out_of_memory": "the compile ran out of memory on an earlier attempt",
+        }[_prev_final]
         _write_status(
             blob_service, job, "failed",
-            stage="timeout",
-            error=f"compile exceeded COMPILE_TIMEOUT_SEC on an earlier attempt; not re-run (dequeue_count {msg.dequeue_count})",
+            stage=_prev_final,
+            error=f"{_prev_error}; not re-run (dequeue_count {msg.dequeue_count})",
+        )
+        _fail_progress_if_ours(
+            blob_service, job, stage=_prev_final,
+            error=f"{_prev_error[0].upper()}{_prev_error[1:]}, so it was not run again. Press Re-parse to try again.",
         )
         _forward_to_poison_queue(
             queue_service,
             raw_message=raw if isinstance(raw, str) else str(raw),
-            reason="timed_out_before",
+            reason=("timed_out_before" if _prev_final == "timeout" else f"{_prev_final}_before"),
             job=job,
             dequeue_count=msg.dequeue_count,
             source_queue=source_queue,
@@ -2291,6 +2717,8 @@ def main() -> int:
             COMPILE_TIMEOUT_SEC, COMPILE_SEC_PER_DOC,
         )
         watchdog = _CompileWatchdog(blob_service, job, budget).start()
+        _INFLIGHT["keepalive"] = _send_keepalive(queue_service, job)
+        memory_guard = _MemoryGuard(blob_service, job).start()
         # Somebody can ask for this compile to stop while it runs. Started here,
         # beside the watchdog, because it needs the queue message: a cancelled
         # compile whose message survives is simply run again a minute later.
@@ -2310,6 +2738,8 @@ def main() -> int:
             _clear_compile_active(blob_service, job)
             canceller.stop()
             watchdog.stop()
+            memory_guard.stop()
+            _delete_keepalive(_INFLIGHT.pop("keepalive", None))
             renewer.stop()
             _INFLIGHT.pop("renewer", None)
             if renewer.renewals or renewer.errors:
