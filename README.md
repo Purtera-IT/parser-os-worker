@@ -81,6 +81,46 @@ Worker writes `deals/{deal_id}/parser-jobs/{compile_id}.json` as it progresses:
 `parser-os-service` exposes a `GET /v1/compile/status/{compile_id}` that
 reads this blob — that's the polling endpoint for the SPA.
 
+## When a compile dies
+
+A compile killed for memory (exit 137) runs no Python, so nothing it could do
+on the way out happens. Three things cover it:
+
+- **Restart recovery.** Each process has a boot id, and `_active-compiles/<id>.json`
+  records the replica and boot that wrote it. A container restarted in the
+  same replica fails its predecessor's runs at startup: compile-progress.json
+  goes to `failed / killed` with the stage and item count reached, so the page
+  frees Re-parse within seconds. The page's own 5-minute stale rule covers a
+  replica that never comes back.
+- **Memory guard.** Past `SOWSMITH_MEMORY_GUARD_FRACTION` (default 0.9) of the
+  container's cgroup limit, the worker fails the run as `out_of_memory` and exits
+  before the kernel kills it. `0` turns it off.
+- **No identical re-runs.** A message whose last attempt ended `timeout`,
+  `killed` or `out_of_memory` goes to the poison queue instead of running again.
+  Every path that gives up on a message also fails the deal's progress document,
+  but only while that document still belongs to the same compile.
+
+### Keeping a replica up while a compile runs (needs an infra change)
+
+KEDA's azure-queue scaler counts visible messages, and a running compile's
+message is invisible, so the warm worker can be scaled to zero mid-compile.
+With `AZURE_STORAGE_QUEUE_INFLIGHT` set, the worker keeps one visible message
+per running compile in that queue (TTL `MESSAGE_LEASE_MAX_SEC`) and deletes it
+when the compile ends. It only helps once the warm worker also scales on that
+queue. Not applied anywhere yet; per environment:
+
+```bash
+az containerapp update -n <warm-worker-app> -g <rg> \
+  --scale-rule-name inflight-compiles --scale-rule-type azure-queue \
+  --scale-rule-metadata queueName=parser-os-compile-inflight queueLength=1 accountName=<storage-account> \
+  --scale-rule-auth connection=<storage-connection-secret-name> \
+  --set-env-vars AZURE_STORAGE_QUEUE_INFLIGHT=parser-os-compile-inflight
+```
+
+Note `az containerapp update --scale-rule-*` replaces the app's scale rules, so
+the existing queue rules must be passed again in the same update (or edit the
+YAML with `az containerapp show -o yaml` / `update --yaml`).
+
 ## Local dev
 
 ```bash
