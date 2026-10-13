@@ -295,66 +295,56 @@ jobs:
           fi
           echo "drain sentinel written — worker will finish its current message and stop taking new ones"
 
-          # Now wait only for the IN-FLIGHT compile, which is bounded by one
+          # Now wait only for the IN-FLIGHT compiles, which is bounded by one
           # compile rather than by how busy the queue is.
-          # Wait on PROGRESS, not on elapsed time. A 45-minute ceiling looked
-          # generous until a real compile blew through it: 86 artifacts, 17,986
-          # atoms, source_replay alone taking 33 minutes. It was perfectly
-          # healthy, and the drain killed the deploy claiming it was "longer
-          # than any healthy compile" -- a statement about compile duration that
-          # this environment simply does not support.
           #
-          # There is no duration that separates a big compile from a stuck one.
-          # Progress does: a working compile keeps opening and closing stages, a
-          # stuck one stops. So fail only when the stage signature has not moved
-          # for STALL_LIMIT, with a generous absolute ceiling underneath the
-          # job timeout as a backstop.
-          STALL_LIMIT=900          # 15 min with no stage change = stuck
+          # Wait on the worker's own record, not on its logs. This step used to
+          # read `az containerapp logs show --tail 40`, which shows ONE replica.
+          # 2026-10-13 15:42: dev had an idle replica beside the one compiling
+          # 010264. The idle one logged "Drain sentinel present" within seconds,
+          # the step read that as "drained", and the roll killed 010264 in
+          # enrich_entities. A busy replica whose last 40 lines held no stage
+          # line read as idle the same way.
+          #
+          # Every running compile keeps _active-compiles/<compile_id>.json
+          # fresh (rewritten with each progress tick, every few seconds) and
+          # deletes it however the compile ends. So: wait until no marker
+          # written by a warm-worker replica has been touched in the last
+          # FRESH_SEC. A marker that stops being touched is a compile that
+          # died, and does not hold the deploy. Markers from the cold-start Job
+          # or a local worker are not this app's and are ignored.
+          FRESH_SEC=300
           DEADLINE=$(( $(date +%s) + 3600 ))
-          LAST_SIG=""
-          LAST_MOVE=$(date +%s)
+          live_compiles() {
+            local cutoff names n live=0
+            cutoff=$(date -u -d "-${FRESH_SEC} seconds" +%Y-%m-%dT%H:%M:%S+00:00)
+            names=$(az storage blob list --account-name "$ACCT" --container-name "$CONTAINER" \
+                      --prefix _active-compiles/ --auth-mode login --only-show-errors \
+                      --query "[?properties.lastModified >= '$cutoff'].name" -o tsv) || { echo err; return; }
+            for n in $names; do
+              REPLICA=$(az storage blob download --account-name "$ACCT" --container-name "$CONTAINER" \
+                          --name "$n" --file /dev/stdout --auth-mode login --only-show-errors -o none 2>/dev/null \
+                        | python3 -c "import json,sys; print(json.load(sys.stdin).get('replica') or '')" 2>/dev/null || true)
+              # Images before 2026-10-13 write no replica: count those, to be safe.
+              case "$REPLICA" in ""|parser-os-worker-warm--*) live=$((live+1)); echo "  running: $n (${REPLICA:-replica unknown})" >&2 ;; esac
+            done
+            echo "$live"
+          }
           while :; do
-            LOGS=$(az containerapp logs show -n parser-os-worker-warm -g "${{ env.JOB_RG }}" \
-                     --tail 40 --only-show-errors 2>/dev/null || true)
-            BUSY=$(printf '%s' "$LOGS" | grep -c 'compile_stage_heartbeat\|compile_stage_started' || true)
-            DRAINED=$(printf '%s' "$LOGS" | grep -c 'Drain sentinel present' || true)
-            if [ "${DRAINED:-0}" -gt 0 ] || [ "${BUSY:-0}" -eq 0 ]; then
-              echo "worker is drained — safe to roll."; exit 0
-            fi
-            # `|| true`: the step runs under bash -e with pipefail, and grep exits 1
-            # when the worker is IDLE (no stage lines in the tail). Without it the
-            # drain died 5s after writing its sentinel -- on exactly the quiet
-            # worker a deploy is supposed to roll straight through.
-            # Liveness, not stage churn: one long stage (a 35-artifact deal
-            # parsing 9 MB of spreadsheets sat in parse_artifacts for 30+
-            # minutes, 2026-09-04) heartbeats every 30 s with a rising
-            # elapsed_s. A compile that heartbeats is alive; only a compile
-            # whose heartbeat AND stage have both frozen is stuck.
-            # `tr -d '\\'` first: Container Apps returns each line as a JSON
-            # envelope whose "Log" field is itself JSON, so the payload arrives
-            # escaped -- \"stage\": \"parse_artifacts\". Matching the unescaped
-            # form found NOTHING, so SIG was always empty, LAST_SIG never moved,
-            # and every compile longer than STALL_LIMIT was declared stuck. The
-            # liveness check was blind in exactly the case it exists for, and
-            # the deploy failed hardest when the worker was busiest.
-            SIG=$(printf '%s' "$LOGS" | tr -d '\\' | grep -o '"stage": "[a-z_]*"\|"elapsed_s": [0-9.]*' | tail -3 | tr -d '\n' || true)
-            if [ "$SIG" != "$LAST_SIG" ]; then
-              LAST_SIG="$SIG"; LAST_MOVE=$(date +%s)
-            fi
-            STALLED=$(( $(date +%s) - LAST_MOVE ))
-            if [ "$STALLED" -ge "$STALL_LIMIT" ]; then
-              echo "::error::the in-flight compile has not changed stage in $((STALLED/60)) minutes."
-              echo "A working compile keeps opening and closing stages; this one has stopped."
-              echo "Investigate before rolling, or re-run with force_roll=true to roll over it."
+            LIVE=$(live_compiles)
+            if [ "$LIVE" = "err" ]; then
+              echo "::error::could not list _active-compiles on $ACCT, so cannot tell whether a compile is running. Not rolling."
               exit 1
+            fi
+            if [ "$LIVE" = "0" ]; then
+              echo "no compile running on the warm worker — safe to roll."; exit 0
             fi
             if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-              echo "::error::drained for 60 minutes and the worker is still busy."
-              echo "The compile was still PROGRESSING, so this is a ceiling, not a stall."
-              echo "Re-run when it finishes, or force_roll=true to roll over it."
+              echo "::error::drained for 60 minutes and $LIVE compile(s) are still running and still updating."
+              echo "Re-run when they finish, or force_roll=true to roll over them."
               exit 1
             fi
-            echo "in-flight compile still finishing (stage moved $((STALLED/60))m ago) — checking again in 60s..."
+            echo "$LIVE compile(s) still running — checking again in 60s..."
             sleep 60
           done
 
