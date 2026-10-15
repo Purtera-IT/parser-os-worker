@@ -97,6 +97,13 @@ export OLLAMA_HOST="${OLLAMA_HOST_TAILSCALE:-http://100.114.102.122:11434}"
 # store fire live; missing -> deflectors abstain -> LLM-only path.
 python /fetch_ml.py || echo "fetch_ml skipped" >&2
 
+# The C3 base ships its own ml/ code (the parser package does not include
+# it); put it on the path only when fetch_ml unpacked it.
+_c3_code="${ML_ARTIFACT_DIR:-/tmp/ml}/c3_base/code"
+if [[ -d "${_c3_code}" ]]; then
+  export PYTHONPATH="${_c3_code}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
+
 # Scrub leftover compile workdirs from prior crashes / OOM kills so /tmp
 # cannot fill again (Errno 28 disk-full → mass queue poison).
 # shellcheck disable=SC2086

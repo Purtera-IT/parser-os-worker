@@ -46,6 +46,11 @@ try:
             return True
         if not include_registry and low.startswith("_head_registry/"):
             return True
+        # The C3 base is streamed straight into its dir below, never saved
+        # as a tarball first: archive plus contents would be ~3.5GB on this
+        # disk at once.
+        if low == "c3_base.tgz":
+            return True
         return False
 
     n = skipped = 0
@@ -122,6 +127,53 @@ try:
             _drop_archive(tp, name)
         except Exception as ex:
             print(f"fetch_ml: extract {name} failed ({ex})", file=sys.stderr)
+    # The C3 base (parser-os ml/c3/pod/bundle.sh): checkpoint, encoder, ml/
+    # code. Read only when the layer is on or in shadow, streamed from blob
+    # through gunzip into {DST}/c3_base, and only with room to spare on disk,
+    # so it can never be what fills /tmp. Loader env (set on the job):
+    #   SOWSMITH_C3_CHECKPOINT={DST}/c3_base/checkpoint.pt
+    #   SOWSMITH_C3_ENCODER={DST}/c3_base/encoder
+    # entrypoint.sh adds {DST}/c3_base/code to PYTHONPATH. Non-fatal.
+    c3_mode = os.environ.get("SOWSMITH_C3_TYPE", "").strip().lower()
+    if c3_mode not in ("", "0", "off", "false", "no"):
+        try:
+            import shutil
+
+            bc = cc.get_blob_client("c3_base.tgz")
+            size = bc.get_blob_properties().size
+            free = shutil.disk_usage(DST).free
+            # Unpacked it is about 2x the archive (the checkpoint compresses
+            # little, the encoder a little); keep 1GB clear for the compile.
+            if free < 2 * size + 1_000_000_000:
+                print(f"fetch_ml: c3_base needs ~{(2 * size + 1e9) / 1e9:.1f}GB free, "
+                      f"{free / 1e9:.1f}GB free; skipped (the layer abstains)", file=sys.stderr)
+            else:
+                stream = bc.download_blob()
+
+                class _Chunks:
+                    def __init__(self, it):
+                        self.it, self.buf = iter(it), b""
+
+                    def read(self, n=-1):
+                        while n < 0 or len(self.buf) < n:
+                            try:
+                                self.buf += next(self.it)
+                            except StopIteration:
+                                break
+                        if n < 0:
+                            out, self.buf = self.buf, b""
+                        else:
+                            out, self.buf = self.buf[:n], self.buf[n:]
+                        return out
+
+                with tarfile.open(fileobj=_Chunks(stream.chunks()), mode="r|gz") as tf:
+                    try:
+                        tf.extractall(DST, filter="data")
+                    except TypeError:
+                        tf.extractall(DST)
+                print(f"fetch_ml: streamed c3_base.tgz ({size / 1e9:.2f}GB) -> {DST}/c3_base")
+        except Exception as ex:
+            print(f"fetch_ml: c3_base skipped ({type(ex).__name__}: {ex})", file=sys.stderr)
 except Exception as e:
     print(f"fetch_ml: skipped ({type(e).__name__}: {e})", file=sys.stderr)
     sys.exit(0)
