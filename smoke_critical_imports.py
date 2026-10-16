@@ -39,8 +39,10 @@ WORKER_DEPS = (
     "app.core.manifest_artifact_dedup",
     "app.core.orbitbrief_envelope",
     "app.core.span_extractor",
-    "app.core.type_head",
 )
+# app.core.type_head is optional: the C3 super heads replaced the type head on
+# the parser-os dev branch (parser-os PR #418), and main.py imports it inside a
+# try (post-compile retrain, off in dev).
 
 missing = []
 for name in WORKER_DEPS:
