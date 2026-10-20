@@ -2535,6 +2535,9 @@ def main() -> int:
     # The compile no longer writes it (SOWSMITH_C3_SOW=off): it waits for the PM's click.
     try:
         _peek = msg.content.decode("utf-8") if isinstance(msg.content, bytes) else str(msg.content)
+        if not _peek.lstrip().startswith("{"):
+            import base64 as _b64
+            _peek = _b64.b64decode(_peek.strip(), validate=True).decode("utf-8")
         _peek_job = json.loads(_peek) if _peek.lstrip().startswith("{") else {}
     except Exception:
         _peek_job = {}
