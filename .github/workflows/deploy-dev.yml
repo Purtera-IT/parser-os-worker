@@ -55,6 +55,8 @@ env:
   JOB_RG: purtera-dev-rg
   PARSER_OS_REPO: https://github.com/Purtera-IT/parser-os.git
   PARSER_OS_SERVICE_REPO: https://github.com/Purtera-IT/parser-os-service.git
+  # Empty until the parser-os GitHub App is set up; see "Token for parser-os".
+  PARSER_OS_APP_ID: ${{ secrets.PARSER_OS_APP_ID }}
 
 jobs:
   build-and-deploy:
@@ -70,15 +72,30 @@ jobs:
         with:
           path: parser-os-worker
 
+      # parser-os is public today, so the checkout needs no credential. It used
+      # to pass GH_REPO_TOKEN, and an expired PAT failed this checkout too --
+      # widening a one-repo problem into a total deploy outage. Before parser-os
+      # goes private (SEC-05), set PARSER_OS_APP_ID + PARSER_OS_APP_KEY for a
+      # GitHub App with contents:read on it: an installation token is minted
+      # per run and never expires. Until both are set this step is skipped and
+      # the checkout uses the default token, exactly as before.
+      - name: Token for parser-os (GitHub App)
+        id: pos_token
+        if: ${{ env.PARSER_OS_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.PARSER_OS_APP_ID }}
+          private-key: ${{ secrets.PARSER_OS_APP_KEY }}
+          owner: Purtera-IT
+          repositories: parser-os
+
       - name: Checkout parser-os
         uses: actions/checkout@v4
         with:
           repository: Purtera-IT/parser-os
           ref: ${{ github.event.inputs.parser_os_ref || 'main' }}
           path: parser-os
-          # parser-os is public: no credential needed. It used to pass
-          # GH_REPO_TOKEN, which meant an expired PAT failed this checkout too —
-          # widening a one-repo problem into a total deploy outage.
+          token: ${{ steps.pos_token.outputs.token || github.token }}
 
       - name: Checkout parser-os-service
         uses: actions/checkout@v4
