@@ -2531,6 +2531,22 @@ def main() -> int:
     # From here until the message is deleted, a termination must hand it back.
     _INFLIGHT.update({"queue_client": queue_client, "msg": msg, "blob_service": blob_service})
 
+    # SowSmith "Run": write the heads' SOW draft for one deal from its latest envelope.
+    # The compile no longer writes it (SOWSMITH_C3_SOW=off): it waits for the PM's click.
+    try:
+        _peek = msg.content.decode("utf-8") if isinstance(msg.content, bytes) else str(msg.content)
+        if not _peek.lstrip().startswith("{"):
+            import base64 as _b64
+            _peek = _b64.b64decode(_peek.strip(), validate=True).decode("utf-8")
+        _peek_job = json.loads(_peek) if _peek.lstrip().startswith("{") else {}
+    except Exception:
+        _peek_job = {}
+    if isinstance(_peek_job, dict) and _peek_job.get("kind") == "sow_draft":
+        _run_sow_draft(blob_service, str(_peek_job.get("deal_id") or ""), _peek_job)
+        _safe_delete_queue_message(queue_client, msg, context="sow_draft")
+        _INFLIGHT.clear()
+        return 0
+
     # Decode
     try:
         # Storage Queue messages may be base64-encoded; the SDK handles that.
@@ -2868,6 +2884,51 @@ def main() -> int:
         return 1
 
 
+def _sow_draft_status(blob_service: BlobServiceClient, deal_id: str, body: dict[str, Any]) -> None:
+    blob_service.get_blob_client(
+        container=BLOB_CONTAINER, blob=f"deals/{deal_id}/orbitbrief/latest/sow-draft-status.json",
+    ).upload_blob(json.dumps(body).encode("utf-8"), overwrite=True)
+
+
+def _run_sow_draft(blob_service: BlobServiceClient, deal_id: str, job: dict[str, Any]) -> None:
+    """Write c3_sow for one deal on demand (SowSmith Run) and store it in the latest envelope and PM handoff.
+
+    Status goes to ``sow-draft-status.json`` (running -> done | failed) so the Studio can wait on it."""
+    import re as _re
+    if not _re.fullmatch(r"[0-9a-fA-F-]{36}", deal_id or ""):
+        log.error("sow_draft: bad deal id %r", deal_id)
+        return
+    started = datetime.now(timezone.utc).isoformat()
+    base = {"deal_id": deal_id, "requested_by": str(job.get("requested_by") or "")[:120], "started_at": started}
+    _sow_draft_status(blob_service, deal_id, {**base, "state": "running"})
+    t0 = time.monotonic()
+    try:
+        latest = f"deals/{deal_id}/orbitbrief/latest/"
+        env = json.loads(blob_service.get_blob_client(container=BLOB_CONTAINER, blob=latest + "envelope.json").download_blob().readall())
+        if not env.get("c3_brief"):
+            raise RuntimeError("the latest envelope has no c3_brief; compile the deal first")
+        from app.core import c3_sow, c3_sow_trace
+        env["c3_sow"] = c3_sow.for_envelope(env)
+        c3_sow_trace.attach(env)
+        env["c3_sow"]["written_at"] = datetime.now(timezone.utc).isoformat()
+        env["c3_sow"]["written_on"] = "sowsmith_run"
+        _upload_envelope(blob_service, deal_id, env)
+        try:
+            pmh_client = blob_service.get_blob_client(container=BLOB_CONTAINER, blob=latest + "PM_HANDOFF.json")
+            pmh = json.loads(pmh_client.download_blob().readall())
+            pmh["c3_sow"] = env["c3_sow"]
+            pmh_client.upload_blob(json.dumps(pmh).encode("utf-8"), overwrite=True)
+        except Exception as exc:  # the Studio reads PM_HANDOFF; say so when it could not be updated
+            log.warning("sow_draft: PM_HANDOFF not updated for %s: %s", deal_id, type(exc).__name__)
+        _sow_draft_status(blob_service, deal_id, {**base, "state": "done", "seconds": round(time.monotonic() - t0, 1),
+                                                   "compile_id": env.get("compile_id"),
+                                                   "locations": len(env["c3_sow"].get("locations") or [])})
+        log.info("sow_draft: %s written in %.1fs", deal_id, time.monotonic() - t0)
+    except Exception as exc:
+        log.exception("sow_draft failed for %s", deal_id)
+        _sow_draft_status(blob_service, deal_id, {**base, "state": "failed", "error": f"{type(exc).__name__}: {str(exc)[:200]}"})
+
+
 if __name__ == "__main__":
     # WORKER_LOOP=1 → warm persistent poller (Container App, minReplicas=1). The pod
     # stays alive polling the queue, so fetch_ml + the bge gate/span torch models load
@@ -2885,3 +2946,4 @@ if __name__ == "__main__":
             _time.sleep(_sleep)
     else:
         sys.exit(main())
+
