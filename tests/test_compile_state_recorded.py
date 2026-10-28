@@ -80,7 +80,7 @@ def test_a_failed_compile_stops_before_envelope_and_done():
     assert raise_ < src.index("_upload_envelope(")
     assert raise_ < src.index('_write_compile_progress("done"')
     # every progress write carries the verdict
-    assert "**_compile_state_fields(compile_state, c3_failures)" in src
+    assert "**_compile_state_fields(compile_state, c3_failures, c3_notices)" in src
 
 
 def test_a_failed_compile_is_recorded_failed_and_not_retried():
@@ -103,3 +103,51 @@ def test_the_queue_message_carries_the_state(http_calls, state):
     assert doc["compileState"] == state
     assert doc["degraded"] is (state == "degraded")
     assert len(qs.sent) == 1 and http_calls == []
+
+
+# ------------------------------------------------ heads notices (deal page banners)
+
+def test_notices_ride_on_the_fields_the_pm_page_reads():
+    deg = {"lines": 9000, "max_atoms": 4096, "max_atoms_top": 8192, "oom_retries": 1, "reads": 1}
+    f = m._compile_state_fields("degraded", [], {"heads_read_degraded": deg})
+    assert f == {"compile_state": "degraded", "degraded": True, "notices": {"heads_read_degraded": deg}}
+    # Nothing to say: no key at all (a warm, full-size read shows nothing).
+    assert "notices" not in m._compile_state_fields("ok", [], {})
+
+
+def test_a_finished_compile_keeps_its_read_notices_but_never_a_wait():
+    caps = {"compile_state": "degraded", "c3_notices": {
+        "heads_read_degraded": {"lines": 9000, "max_atoms": 2048},
+        "large_deal": {"lines": 9000, "threshold": 8000},
+        "heads_warming": {"since": "2026-10-27T00:00:00+00:00"},  # stale: the wait ended
+        "something_else": {"x": 1}}}
+    assert set(m._compile_notices(_result(caps))) == {"heads_read_degraded", "large_deal"}
+    assert m._compile_notices(_result(None)) == {}
+    assert m._compile_notices(_result({"c3_notices": "nonsense"})) == {}
+
+
+def test_live_notices_are_read_from_the_running_parser(monkeypatch):
+    import sys
+
+    fake = types.SimpleNamespace(compile_notices=lambda: {
+        "heads_warming": {"since": "2026-10-27T00:00:00+00:00", "waited_s": 63.0, "attempts": 4},
+        "unrelated": {"x": 1}})
+    monkeypatch.setitem(sys.modules, "app.core.telemetry", fake)
+    monkeypatch.setitem(sys.modules, "app.core", types.SimpleNamespace(telemetry=fake))
+    assert set(m._live_notices()) == {"heads_warming"}
+
+
+def test_live_notices_from_a_parser_without_them_are_empty(monkeypatch):
+    import sys
+
+    fake = types.SimpleNamespace()  # an older parser: no compile_notices
+    monkeypatch.setitem(sys.modules, "app.core.telemetry", fake)
+    monkeypatch.setitem(sys.modules, "app.core", types.SimpleNamespace(telemetry=fake))
+    assert m._live_notices() == {}
+
+
+def test_every_progress_write_carries_the_notices():
+    src = inspect.getsource(m._do_compile)
+    live = src.index("_notices = _live_notices()")
+    assert src.index('"stage_items_total": _items_total,') < live < src.index("upload_blob(", live)
+    assert "_compile_state_fields(compile_state, c3_failures, c3_notices)" in src
