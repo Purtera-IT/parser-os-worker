@@ -138,4 +138,4 @@ def test_no_mode_leaves_the_message_unchanged(http_calls):
     qs = _QueueService()
     m._notify_orbitbrief_core(qs, _job(None))
     doc = _payload(qs.sent[0])
-    assert set(doc) == {"dealId", "compileId", "envelopeReady"}
+    assert set(doc) == {"dealId", "compileId", "envelopeReady", "compileState", "degraded"}

@@ -1292,6 +1292,45 @@ def _write_run_index(blob_service: BlobServiceClient, payload: dict[str, Any]) -
         log.warning("Failed to write run index: %s", exc)
 
 
+# The parser's own verdict on a compile (parser-os compile_capabilities):
+#   ok       -- normal
+#   degraded -- a C3 heads read failed on the default path and its lines went
+#               to the LLM / old judge instead (warning + c3_heads_unavailable
+#               event in the parser); the compile is usable but the PM must see it
+#   failed   -- zero evidence atoms; nothing to brief, never "done"
+# An older parser that does not report it is "ok" (the previous behaviour).
+COMPILE_STATES = ("ok", "degraded", "failed")
+
+
+def _compile_state(result: Any) -> tuple[str, list[dict[str, Any]]]:
+    """(compile_state, c3_failures) from a parser-os CompileResult."""
+    caps = getattr(result, "compile_capabilities", None)
+    caps = caps if isinstance(caps, dict) else {}
+    state = str(caps.get("compile_state") or "ok").strip().lower()
+    if state not in COMPILE_STATES:
+        # Unknown verdict from a newer parser: surface it, don't call it ok.
+        state = "degraded"
+    failures = caps.get("c3_failures")
+    return state, (list(failures) if isinstance(failures, list) else [])
+
+
+class CompileStateFailed(RuntimeError):
+    """The parser itself said compile_state == "failed" (zero evidence atoms).
+
+    Deterministic: the same inputs fail the same way, so the message is not
+    retried, no envelope is written over the last good one, and no brief is
+    requested.
+    """
+
+
+def _compile_state_fields(state: str, failures: list[dict[str, Any]]) -> dict[str, Any]:
+    """The fields the PM page reads: compile_state, degraded, c3_failures."""
+    out: dict[str, Any] = {"compile_state": state, "degraded": state == "degraded"}
+    if failures:
+        out["c3_failures"] = failures[:20]
+    return out
+
+
 def _write_status(
     blob_service: BlobServiceClient,
     job: JobMessage,
@@ -1455,7 +1494,7 @@ def _compile_mode(job: "JobMessage") -> str | None:
 
 
 def _enqueue_brief_gen(
-    queue_service: QueueServiceClient, job: "JobMessage"
+    queue_service: QueueServiceClient, job: "JobMessage", compile_state: str = "ok",
 ) -> None:
     """Notify the brief-gen queue (parser-os-orbitbrief-jobs) that a fresh
     v45.2 envelope has been written.  Function App queueTrigger picks this up
@@ -1485,6 +1524,10 @@ def _enqueue_brief_gen(
     if mode:
         payload["mode"] = mode
         payload["briefWanted"] = mode != "parse_only"
+    # The parser's verdict, so the consumer / PM page can show a degraded parse.
+    # A failed compile never gets here (no envelope, no message).
+    payload["compileState"] = compile_state
+    payload["degraded"] = compile_state == "degraded"
     try:
         bqc.send_message(json.dumps(payload))
     except Exception:
@@ -1502,7 +1545,9 @@ def _enqueue_brief_gen(
     )
 
 
-def _notify_orbitbrief_core(queue_service: QueueServiceClient, job: "JobMessage") -> None:
+def _notify_orbitbrief_core(
+    queue_service: QueueServiceClient, job: "JobMessage", compile_state: str = "ok",
+) -> None:
     """Tell OrbitBrief that a fresh envelope exists: exactly ONE notification.
 
     The brief-gen queue message is the only Core notification. The Function App
@@ -1518,7 +1563,7 @@ def _notify_orbitbrief_core(queue_service: QueueServiceClient, job: "JobMessage"
     Best-effort: a failure is logged loudly and never fails the compile.
     """
     try:
-        _enqueue_brief_gen(queue_service, job)
+        _enqueue_brief_gen(queue_service, job, compile_state=compile_state)
     except Exception as exc:
         log.warning(
             "Brief-gen enqueue failed for deal=%s compile=%s: %s",
@@ -2069,6 +2114,19 @@ def _do_compile(
         # document reads "running quality_gates" after envelope.json exists.
         _progress_heartbeat.stop()
 
+        # The parser's verdict, recorded as it said it -- never a silent "done".
+        compile_state, c3_failures = _compile_state(result)
+        if compile_state == "failed":
+            raise CompileStateFailed(
+                f"parser compile_state=failed ({len(getattr(result, 'atoms', []) or [])} "
+                "evidence atoms); not projected, no envelope written, no brief requested"
+            )
+        if compile_state == "degraded":
+            log.warning(
+                "Compile %s for deal %s is DEGRADED: C3 heads unavailable on %d read(s): %s",
+                job.compile_id, job.deal_id, len(c3_failures), c3_failures[:5],
+            )
+
         # v58: the parser STAGES are done — but build_orbitbrief_envelope()
         # below (the OrbitBrief projection: cockpit surfaces, facet sections,
         # service_routing head) still takes ~90s and IS the deliverable the UI
@@ -2115,6 +2173,7 @@ def _do_compile(
                         ),
                         "worker_sha": WORKER_SHA,
                         "parser_os_sha": PARSER_OS_SHA,
+                        **_compile_state_fields(compile_state, c3_failures),
                     }, indent=2, default=str).encode("utf-8"),
                     overwrite=True,
                     content_type="application/json",
@@ -2318,6 +2377,8 @@ def _do_compile(
             "elapsed_sec": elapsed,
             "sow_version": sow_version,
             "llm_call_count": len(llm_calls),
+            "compile_state": compile_state,
+            "c3_failures": c3_failures,
         }
     finally:
         # Restore monkey-patched call sites and clean tempdir.
@@ -2758,11 +2819,16 @@ def main() -> int:
             atom_count=result["atom_count"],
             elapsed_sec=round(result["elapsed_sec"], 2),
             envelope_path=result["envelope_path"],
+            **_compile_state_fields(
+                result.get("compile_state", "ok"), result.get("c3_failures") or [],
+            ),
         )
 
         # The one OrbitBrief Core notification for this parse (see
         # _notify_orbitbrief_core). Best-effort; never fails the compile.
-        _notify_orbitbrief_core(queue_service, job)
+        _notify_orbitbrief_core(
+            queue_service, job, compile_state=result.get("compile_state", "ok"),
+        )
 
         _safe_delete_queue_message(queue_client, msg, context="compile success")
         _INFLIGHT.clear()
@@ -2820,6 +2886,7 @@ def main() -> int:
                     "error": f"{type(exc).__name__}: {exc}"[:500],
                     "worker_sha": WORKER_SHA,
                     "parser_os_sha": PARSER_OS_SHA,
+                    **(_compile_state_fields("failed", []) if isinstance(exc, CompileStateFailed) else {}),
                 }, indent=2, default=str).encode("utf-8"),
                 overwrite=True,
                 content_type="application/json",
@@ -2832,16 +2899,18 @@ def main() -> int:
         # interactive reparses (the dev "zombie storm"). Transient failures still
         # retry.
         msg_l = f"{type(exc).__name__}: {exc}".lower()
-        permanent = (
+        state_failed = isinstance(exc, CompileStateFailed)
+        permanent = state_failed or (
             "blobnotfound" in msg_l
             or "the specified blob does not exist" in msg_l
             or ("notfound" in type(exc).__name__.lower() and "blob" in msg_l)
         )
         _write_status(
             blob_service, job, "failed",
-            stage=("dead_deal" if permanent else "exception"),
+            stage=("no_evidence" if state_failed else "dead_deal" if permanent else "exception"),
             error=f"{type(exc).__name__}: {exc}",
             traceback=traceback.format_exc()[:4000],
+            **(_compile_state_fields("failed", []) if state_failed else {}),
         )
         if permanent:
             log.error("Permanent failure (dead deal / missing blob) — dropping message to break the zombie cycle")
