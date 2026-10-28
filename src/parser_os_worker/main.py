@@ -1323,12 +1323,48 @@ class CompileStateFailed(RuntimeError):
     """
 
 
-def _compile_state_fields(state: str, failures: list[dict[str, Any]]) -> dict[str, Any]:
-    """The fields the PM page reads: compile_state, degraded, c3_failures."""
+def _compile_state_fields(state: str, failures: list[dict[str, Any]],
+                          notices: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The fields the PM page reads: compile_state, degraded, c3_failures, notices."""
     out: dict[str, Any] = {"compile_state": state, "degraded": state == "degraded"}
     if failures:
         out["c3_failures"] = failures[:20]
+    if notices:
+        out["notices"] = dict(notices)
     return out
+
+
+# What the deal page is told about the C3 heads (parser-os c3_type_base notices):
+#   heads_warming       -- live only: the compile is waiting on a heads service that
+#                          is starting (scale-to-zero cold start, ~4 min); since /
+#                          waited_s / attempts. Gone once the heads answer.
+#   heads_read_degraded -- the heads read the deal in smaller windows than full size
+#                          (out-of-memory retry): {lines, max_atoms, max_atoms_top,
+#                          oom_retries, reads}. Kept on the finished record.
+#   large_deal          -- the heads read more than ~8,000 lines: {lines, threshold}.
+# Copied into compile-progress.json as `notices` on every write; absent when there is
+# nothing to say (warm service, full-size read).
+NOTICE_KEYS = ("heads_warming", "heads_read_degraded", "large_deal")
+
+
+def _live_notices() -> dict[str, Any]:
+    """The running compile's notices (parser-os runs in this process; read from the
+    progress thread like ``stage_progress``). {} from a parser that has none."""
+    try:
+        from app.core import telemetry as _t
+        got = _t.compile_notices()
+    except Exception:
+        return {}
+    return {k: v for k, v in (got or {}).items() if k in NOTICE_KEYS and isinstance(v, dict)}
+
+
+def _compile_notices(result: Any) -> dict[str, Any]:
+    """The finished compile's notices (compile_capabilities.c3_notices): never a wait."""
+    caps = getattr(result, "compile_capabilities", None)
+    got = caps.get("c3_notices") if isinstance(caps, dict) else None
+    if not isinstance(got, dict):
+        return {}
+    return {k: v for k, v in got.items() if k in NOTICE_KEYS and k != "heads_warming" and isinstance(v, dict)}
 
 
 def _write_status(
@@ -2015,6 +2051,10 @@ def _do_compile(
                 "stage_items_done": _items_done,
                 "stage_items_total": _items_total,
             }
+            # "Waking up the model" / "read in smaller pieces" / "big deal" (NOTICE_KEYS).
+            _notices = _live_notices()
+            if _notices:
+                payload["notices"] = _notices
             try:
                 blob_service.get_blob_client(
                     container=BLOB_CONTAINER, blob=progress_path,
@@ -2116,6 +2156,7 @@ def _do_compile(
 
         # The parser's verdict, recorded as it said it -- never a silent "done".
         compile_state, c3_failures = _compile_state(result)
+        c3_notices = _compile_notices(result)
         if compile_state == "failed":
             raise CompileStateFailed(
                 f"parser compile_state=failed ({len(getattr(result, 'atoms', []) or [])} "
@@ -2123,8 +2164,8 @@ def _do_compile(
             )
         if compile_state == "degraded":
             log.warning(
-                "Compile %s for deal %s is DEGRADED: C3 heads unavailable on %d read(s): %s",
-                job.compile_id, job.deal_id, len(c3_failures), c3_failures[:5],
+                "Compile %s for deal %s is DEGRADED: C3 heads unavailable on %d read(s): %s; notices: %s",
+                job.compile_id, job.deal_id, len(c3_failures), c3_failures[:5], c3_notices,
             )
 
         # v58: the parser STAGES are done — but build_orbitbrief_envelope()
@@ -2173,7 +2214,7 @@ def _do_compile(
                         ),
                         "worker_sha": WORKER_SHA,
                         "parser_os_sha": PARSER_OS_SHA,
-                        **_compile_state_fields(compile_state, c3_failures),
+                        **_compile_state_fields(compile_state, c3_failures, c3_notices),
                     }, indent=2, default=str).encode("utf-8"),
                     overwrite=True,
                     content_type="application/json",
@@ -2379,6 +2420,7 @@ def _do_compile(
             "llm_call_count": len(llm_calls),
             "compile_state": compile_state,
             "c3_failures": c3_failures,
+            "c3_notices": c3_notices,
         }
     finally:
         # Restore monkey-patched call sites and clean tempdir.
@@ -2821,6 +2863,7 @@ def main() -> int:
             envelope_path=result["envelope_path"],
             **_compile_state_fields(
                 result.get("compile_state", "ok"), result.get("c3_failures") or [],
+                result.get("c3_notices") or {},
             ),
         )
 
