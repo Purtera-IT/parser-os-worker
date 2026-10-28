@@ -49,6 +49,32 @@ def test_sow_draft_writes_envelope_and_handoff(monkeypatch):
     status = json.loads(store[latest + "sow-draft-status.json"])
     assert env["c3_sow"]["written_on"] == "sowsmith_run" and pmh["c3_sow"]["locations"] == [{"site": "dc 5841"}]
     assert status["state"] == "done" and status["locations"] == 1
+    assert status["draft_status"] == "unknown"
+
+
+def test_sow_draft_status_carries_the_drafts_own_status(monkeypatch):
+    latest = f"deals/{DEAL}/orbitbrief/latest/"
+    store = {latest + "envelope.json": json.dumps({"compile_id": "c1", "c3_brief": {"sections": {}}}).encode()}
+    _fake_sow(monkeypatch, {"locations": [], "draft_status": "degraded", "llm_failures": [{"call": "assumptions", "tries": 3}],
+                            "site_source": "heads:site_readiness", "job_family": "cameras_security",
+                            "job_family_by": "rule:route_family", "origin_counts": {"DEAL": 5, "TEMPLATE": 2}})
+    monkeypatch.setattr(w, "_upload_envelope", lambda svc, deal, env: None)
+    w._run_sow_draft(_Svc(store), DEAL, {"kind": "sow_draft", "deal_id": DEAL})
+    status = json.loads(store[latest + "sow-draft-status.json"])
+    assert status["state"] == "done" and status["draft_status"] == "degraded"
+    assert "assumptions" in status["degraded_because"] and status["llm_failures"] == ["assumptions"]
+    assert status["site_source"] == "heads:site_readiness" and status["job_family_by"] == "rule:route_family"
+    assert status["origin_counts"] == {"DEAL": 5, "TEMPLATE": 2} and "failed_because" not in status
+
+
+def test_sow_draft_failed_draft_says_why(monkeypatch):
+    latest = f"deals/{DEAL}/orbitbrief/latest/"
+    store = {latest + "envelope.json": json.dumps({"compile_id": "c1", "c3_brief": {"sections": {}}}).encode()}
+    _fake_sow(monkeypatch, {"draft_status": "failed", "failed_because": "LLM call(s) scope returned nothing usable after every retry"})
+    monkeypatch.setattr(w, "_upload_envelope", lambda svc, deal, env: None)
+    w._run_sow_draft(_Svc(store), DEAL, {"kind": "sow_draft", "deal_id": DEAL})
+    status = json.loads(store[latest + "sow-draft-status.json"])
+    assert status["draft_status"] == "failed" and "scope" in status["failed_because"]
 
 
 def test_sow_draft_without_a_brief_fails_loudly(monkeypatch):
@@ -58,6 +84,7 @@ def test_sow_draft_without_a_brief_fails_loudly(monkeypatch):
     w._run_sow_draft(_Svc(store), DEAL, {"kind": "sow_draft", "deal_id": DEAL})
     status = json.loads(store[latest + "sow-draft-status.json"])
     assert status["state"] == "failed" and "c3_brief" in status["error"]
+    assert status["draft_status"] == "failed" and "c3_brief" in status["failed_because"]
 
 
 def test_sow_draft_rejects_a_bad_deal_id():

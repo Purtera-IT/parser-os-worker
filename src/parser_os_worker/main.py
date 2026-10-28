@@ -2972,6 +2972,26 @@ def _sow_draft_status(blob_service: BlobServiceClient, deal_id: str, body: dict[
     ).upload_blob(json.dumps(body).encode("utf-8"), overwrite=True)
 
 
+def _sow_draft_summary(c3_sow: dict[str, Any]) -> dict[str, Any]:
+    """What the Studio shows about a written draft, from c3_sow itself: ``draft_status`` (ok | degraded |
+    failed; parser-os ``_draft_status``) with ``failed_because`` / ``degraded_because``, where the sites
+    came from, who chose the job family, and how many lines are deal facts vs template."""
+    c = c3_sow if isinstance(c3_sow, dict) else {}
+    status = str(c.get("draft_status") or ("failed" if c.get("error") else "unknown"))
+    out: dict[str, Any] = {"draft_status": status}
+    if status == "failed":
+        out["failed_because"] = str(c.get("failed_because") or c.get("error") or "the SOW writer gave no reason")[:300]
+    calls = sorted({str(f.get("call")) for f in c.get("llm_failures") or [] if isinstance(f, dict) and f.get("call")})
+    if status == "degraded":
+        out["degraded_because"] = ("LLM call(s) " + ", ".join(calls) + " returned nothing usable; those steps ran without an answer") if calls else "the SOW writer marked it degraded"
+    if calls:
+        out["llm_failures"] = calls
+    for k in ("site_source", "job_family", "job_family_by", "origin_counts"):
+        if c.get(k) is not None:
+            out[k] = c[k]
+    return out
+
+
 def _run_sow_draft(blob_service: BlobServiceClient, deal_id: str, job: dict[str, Any]) -> None:
     """Write c3_sow for one deal on demand (SowSmith Run) and store it in the latest envelope and PM handoff.
 
@@ -3004,11 +3024,14 @@ def _run_sow_draft(blob_service: BlobServiceClient, deal_id: str, job: dict[str,
             log.warning("sow_draft: PM_HANDOFF not updated for %s: %s", deal_id, type(exc).__name__)
         _sow_draft_status(blob_service, deal_id, {**base, "state": "done", "seconds": round(time.monotonic() - t0, 1),
                                                    "compile_id": env.get("compile_id"),
-                                                   "locations": len(env["c3_sow"].get("locations") or [])})
+                                                   "locations": len(env["c3_sow"].get("locations") or []),
+                                                   **_sow_draft_summary(env["c3_sow"])})
         log.info("sow_draft: %s written in %.1fs", deal_id, time.monotonic() - t0)
     except Exception as exc:
         log.exception("sow_draft failed for %s", deal_id)
-        _sow_draft_status(blob_service, deal_id, {**base, "state": "failed", "error": f"{type(exc).__name__}: {str(exc)[:200]}"})
+        _sow_draft_status(blob_service, deal_id, {**base, "state": "failed", "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                                                   "draft_status": "failed",
+                                                   "failed_because": f"{type(exc).__name__}: {str(exc)[:200]}"})
 
 
 if __name__ == "__main__":
