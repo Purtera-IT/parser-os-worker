@@ -1443,6 +1443,17 @@ def _forward_to_poison_queue(
         log.warning("Failed to forward poison message to %s: %s", POISON_QUEUE_NAME, exc)
 
 
+def _compile_mode(job: "JobMessage") -> str | None:
+    """``compile_options.mode`` as the producer set it, or None when unset.
+
+    Producers: Platform ``triggerReparseOnly`` sends ``parse_only`` (Re-parse)
+    or ``parse_and_brief`` (Run); passive enqueues send ``parse_and_brief``.
+    """
+    raw = (job.compile_options or {}).get("mode")
+    mode = str(raw or "").strip().lower()
+    return mode or None
+
+
 def _enqueue_brief_gen(
     queue_service: QueueServiceClient, job: "JobMessage"
 ) -> None:
@@ -1466,6 +1477,14 @@ def _enqueue_brief_gen(
         "compileId": job.compile_id,
         "envelopeReady": True,
     }
+    # Carry the producer's compile_options.mode through, so the consumer can
+    # tell "Re-parse" (parse_only) from "Run" (parse_and_brief). The message is
+    # still always sent: the consumer's completion step (attachment status,
+    # scope, amount) must run on every parse, brief or not.
+    mode = _compile_mode(job)
+    if mode:
+        payload["mode"] = mode
+        payload["briefWanted"] = mode != "parse_only"
     try:
         bqc.send_message(json.dumps(payload))
     except Exception:
@@ -1483,61 +1502,28 @@ def _enqueue_brief_gen(
     )
 
 
-def _trigger_brief_gen_http(job: "JobMessage") -> None:
-    """Kick brief-gen (PM_HANDOFF etc.) on orbitbrief-core-worker right after the
-    parse, so the OrbitBrief page is fresh on EVERY run.
+def _notify_orbitbrief_core(queue_service: QueueServiceClient, job: "JobMessage") -> None:
+    """Tell OrbitBrief that a fresh envelope exists: exactly ONE notification.
 
-    Queue path (parser-os-orbitbrief-jobs) is the primary notify; this HTTP call
-    is the live backup when the Function App consumer is slow/absent.
-    Best-effort: any failure just leaves the brief stale; it never fails compile.
+    The brief-gen queue message is the only Core notification. The Function App
+    consumer (parser-os-orbitbrief-queue) IS deployed on dev and prod: it runs
+    the completion step (attachment status, scope, amount), inserts the
+    orbitbrief_runs row, and the runs timer dispatches Core with the
+    duplicate-run guard, the concurrency cap, PM-answer replay and stuck-run
+    recovery. The worker used to ALSO POST Core's compile-run route directly,
+    under a comment claiming the consumer wasn't deployed; every deal then
+    compiled twice concurrently and the last writer won latest/. Do not add a
+    second notifier here.
 
-    NOTE: the worker routes HTTP through the Tailscale proxy (for Ollama), but
-    orbitbrief-core-worker is a public Azure ingress URL — so we use an opener with
-    an EMPTY ProxyHandler to connect DIRECT, bypassing the proxy.
+    Best-effort: a failure is logged loudly and never fails the compile.
     """
-    base = os.environ.get("ORBITBRIEF_CORE_WORKER_URL", "").strip()
-    if not base:
-        log.info("ORBITBRIEF_CORE_WORKER_URL unset; skipping brief-gen trigger.")
-        return
-    import time as _time
-    import urllib.error
-    import urllib.request
-    import uuid
-
-    bearer = os.environ.get("ORBITBRIEF_CORE_WORKER_BEARER", "").strip()
-    run_id = uuid.uuid4().hex
-    payload = json.dumps(
-        {"deal_id": job.deal_id, "run_id": run_id, "mirror_latest": True}
-    ).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if bearer:
-        headers["Authorization"] = f"Bearer {bearer}"
-    url = f"{base.rstrip('/')}/v1/compile-run?async=1"
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # direct, no proxy
-    last_exc: Exception | None = None
-    for attempt in range(1, 4):
-        req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
-        try:
-            with opener.open(req, timeout=20) as resp:
-                status = getattr(resp, "status", None) or resp.getcode()
-                if 200 <= int(status) < 300:
-                    log.info(
-                        "Brief-gen triggered (HTTP %s) deal=%s run=%s attempt=%s",
-                        status, job.deal_id, run_id, attempt,
-                    )
-                    return
-                body = resp.read()[:300]
-                last_exc = RuntimeError(f"HTTP {status}: {body!r}")
-        except Exception as exc:
-            last_exc = exc
+    try:
+        _enqueue_brief_gen(queue_service, job)
+    except Exception as exc:
         log.warning(
-            "Brief-gen HTTP attempt %s failed deal=%s: %s",
-            attempt, job.deal_id, last_exc,
+            "Brief-gen enqueue failed for deal=%s compile=%s: %s",
+            job.deal_id, job.compile_id, exc,
         )
-        _time.sleep(min(2 * attempt, 6))
-    raise RuntimeError(
-        f"Brief-gen HTTP trigger failed after retries deal={job.deal_id}: {last_exc}"
-    )
 
 
 # v56: Side-channel atoms.json with the raw parser-os atom list — bypasses
@@ -2774,25 +2760,9 @@ def main() -> int:
             envelope_path=result["envelope_path"],
         )
 
-        # Notify brief-gen worker that a fresh v45.2 envelope is ready.
-        # Best-effort — log loudly on failure but don't fail the compile job.
-        try:
-            _enqueue_brief_gen(queue_service, job)
-        except Exception as exc:
-            log.warning(
-                "Brief-gen enqueue failed for deal=%s compile=%s: %s",
-                job.deal_id, job.compile_id, exc,
-            )
-        # The queue consumer above isn't deployed, so ALSO trigger brief-gen
-        # directly over HTTP — this is the live auto-trigger that keeps OrbitBrief
-        # fresh after every parse. Best-effort; never fails the compile.
-        try:
-            _trigger_brief_gen_http(job)
-        except Exception as exc:
-            log.warning(
-                "Brief-gen HTTP trigger failed for deal=%s compile=%s: %s",
-                job.deal_id, job.compile_id, exc,
-            )
+        # The one OrbitBrief Core notification for this parse (see
+        # _notify_orbitbrief_core). Best-effort; never fails the compile.
+        _notify_orbitbrief_core(queue_service, job)
 
         _safe_delete_queue_message(queue_client, msg, context="compile success")
         _INFLIGHT.clear()
