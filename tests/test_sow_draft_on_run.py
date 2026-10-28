@@ -91,3 +91,14 @@ def test_sow_draft_rejects_a_bad_deal_id():
     store = {}
     w._run_sow_draft(_Svc(store), "../../etc", {"kind": "sow_draft"})
     assert store == {}
+
+
+def test_sow_draft_says_degraded_when_the_handoff_was_not_updated(monkeypatch):
+    latest = f"deals/{DEAL}/orbitbrief/latest/"
+    store = {latest + "envelope.json": json.dumps({"compile_id": "c1", "c3_brief": {"sections": {}}}).encode()}
+    _fake_sow(monkeypatch, {"locations": [], "draft_status": "ok"})
+    monkeypatch.setattr(w, "_upload_envelope", lambda svc, deal, env: None)
+    w._run_sow_draft(_Svc(store), DEAL, {"kind": "sow_draft", "deal_id": DEAL})  # no PM_HANDOFF.json in the store
+    status = json.loads(store[latest + "sow-draft-status.json"])
+    assert status["state"] == "done" and status["draft_status"] == "degraded"
+    assert "PM_HANDOFF not updated" in status["degraded_because"]

@@ -3015,17 +3015,27 @@ def _run_sow_draft(blob_service: BlobServiceClient, deal_id: str, job: dict[str,
         env["c3_sow"]["written_at"] = datetime.now(timezone.utc).isoformat()
         env["c3_sow"]["written_on"] = "sowsmith_run"
         _upload_envelope(blob_service, deal_id, env)
+        handoff_error = ""
         try:
             pmh_client = blob_service.get_blob_client(container=BLOB_CONTAINER, blob=latest + "PM_HANDOFF.json")
             pmh = json.loads(pmh_client.download_blob().readall())
             pmh["c3_sow"] = env["c3_sow"]
             pmh_client.upload_blob(json.dumps(pmh).encode("utf-8"), overwrite=True)
         except Exception as exc:  # the Studio reads PM_HANDOFF; say so when it could not be updated
+            handoff_error = f"{type(exc).__name__}: {str(exc)[:160]}"
             log.warning("sow_draft: PM_HANDOFF not updated for %s: %s", deal_id, type(exc).__name__)
+        summary = _sow_draft_summary(env["c3_sow"])
+        if handoff_error:
+            # The draft was written to the envelope but the Studio reads PM_HANDOFF, which still holds
+            # the previous draft: "done / ok" here showed the PM a stale SOW as the new one.
+            summary["draft_status"] = "failed" if summary.get("draft_status") == "failed" else "degraded"
+            summary["degraded_because"] = "; ".join(x for x in (
+                summary.get("degraded_because"), f"PM_HANDOFF not updated ({handoff_error}): the Studio still "
+                "shows the previous draft") if x)
         _sow_draft_status(blob_service, deal_id, {**base, "state": "done", "seconds": round(time.monotonic() - t0, 1),
                                                    "compile_id": env.get("compile_id"),
                                                    "locations": len(env["c3_sow"].get("locations") or []),
-                                                   **_sow_draft_summary(env["c3_sow"])})
+                                                   **summary})
         log.info("sow_draft: %s written in %.1fs", deal_id, time.monotonic() - t0)
     except Exception as exc:
         log.exception("sow_draft failed for %s", deal_id)
