@@ -283,6 +283,8 @@ def _mark_compile_active(
                 "replica": _REPLICA,
                 "boot_id": _BOOT_ID,
                 "keepalive": _INFLIGHT.get("keepalive"),
+                # A delivery read's progress lives in its own folder; recovery needs to know which.
+                **({"read": DELIVERY_READ} if _read_of(job) else {}),
             }).encode("utf-8"),
             overwrite=True,
             content_type="application/json",
@@ -347,8 +349,32 @@ _BOOT_ID = f"{os.getpid()}-{time.time_ns()}"
 _DO_NOT_RERUN_STAGES = frozenset({"timeout", "killed", "out_of_memory"})
 
 
-def _progress_blob_path(deal_id: str) -> str:
-    return f"deals/{deal_id}/orbitbrief/latest/compile-progress.json"
+#: The delivery read (owner 2026-10-29): the deal read in the planning view -- every line up to our first
+#: kickoff after the win, our signed SOW included -- for the project's Delivery sources page. It is asked
+#: for with ``compile_options.read = "delivery"`` and writes ONLY under ``deals/<id>/delivery/latest/``:
+#: never the quoting envelope, the brief, the SOW draft, the quote or the change-detection fingerprint.
+DELIVERY_READ = "delivery"
+
+
+def _read_of(job: Any) -> str:
+    """``"delivery"`` for a delivery read, else '' (the deal's one quoting/brief compile)."""
+    opts = getattr(job, "compile_options", None)
+    if isinstance(opts, dict):
+        raw = opts.get("read")
+    else:
+        raw = getattr(job, "read", "")
+    return DELIVERY_READ if str(raw or "").strip().lower() == DELIVERY_READ else ""
+
+
+def _latest_prefix(deal_id: str, read: str = "") -> str:
+    """Where a compile's outputs live: the delivery read has its own folder."""
+    if read == DELIVERY_READ:
+        return f"deals/{deal_id}/delivery/latest/"
+    return f"deals/{deal_id}/orbitbrief/latest/"
+
+
+def _progress_blob_path(deal_id: str, read: str = "") -> str:
+    return _latest_prefix(deal_id, read) + "compile-progress.json"
 
 
 def _fail_progress_if_ours(
@@ -373,7 +399,7 @@ def _fail_progress_if_ours(
         from azure.core.exceptions import ResourceNotFoundError
 
         client = blob_service.get_blob_client(
-            container=BLOB_CONTAINER, blob=_progress_blob_path(job.deal_id),
+            container=BLOB_CONTAINER, blob=_progress_blob_path(job.deal_id, _read_of(job)),
         )
         current: dict[str, Any] = {}
         etag = None
@@ -462,8 +488,8 @@ def recover_dead_runs(blob_service: Any, queue_service: Any = None) -> int:
         compile_id, deal_id = marker.get("compile_id"), marker.get("deal_id")
         if not compile_id or not deal_id:
             continue
-        job = SimpleJob(deal_id=str(deal_id), compile_id=str(compile_id))
-        progress = _read_progress(blob_service, job.deal_id)
+        job = SimpleJob(deal_id=str(deal_id), compile_id=str(compile_id), read=_read_of(marker))
+        progress = _read_progress(blob_service, job.deal_id, job.read)
         error = _killed_run_message(
             marker.get("stage") or (progress or {}).get("current_stage"),
             (progress or {}).get("stage_items_done"),
@@ -484,12 +510,13 @@ class SimpleJob:
 
     deal_id: str
     compile_id: str
+    read: str = ""
 
 
-def _read_progress(blob_service: Any, deal_id: str) -> dict[str, Any] | None:
+def _read_progress(blob_service: Any, deal_id: str, read: str = "") -> dict[str, Any] | None:
     try:
         raw = blob_service.get_blob_client(
-            container=BLOB_CONTAINER, blob=_progress_blob_path(deal_id),
+            container=BLOB_CONTAINER, blob=_progress_blob_path(deal_id, read),
         ).download_blob().readall()
         parsed = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace"))
         return parsed if isinstance(parsed, dict) else None
@@ -776,7 +803,7 @@ class _CancelWatcher:
         # The same path `_do_compile` writes its live progress to. Derived
         # rather than passed, so this can be started beside the watchdog in the
         # outer function where the queue message is still in scope.
-        self._progress_path = f"deals/{job.deal_id}/orbitbrief/latest/compile-progress.json"
+        self._progress_path = _progress_blob_path(job.deal_id, _read_of(job))
         self._started_iso = _iso_now()
         self._poll = max(1.0, float(poll_sec))
         self._done = threading.Event()
@@ -1009,7 +1036,7 @@ def _release_inflight(reason: str) -> None:
     try:
         blob_service.get_blob_client(
             container=BLOB_CONTAINER,
-            blob=f"deals/{job.deal_id}/orbitbrief/latest/compile-progress.json",
+            blob=_progress_blob_path(job.deal_id, _read_of(job)),
         ).upload_blob(
             json.dumps({
                 "compile_id": job.compile_id,
@@ -1464,9 +1491,9 @@ def _unchanged_since_last_compile(
 
 
 def _upload_envelope(
-    blob_service: BlobServiceClient, deal_id: str, envelope: dict[str, Any]
+    blob_service: BlobServiceClient, deal_id: str, envelope: dict[str, Any], read: str = ""
 ) -> str:
-    path = f"deals/{deal_id}/orbitbrief/latest/envelope.json"
+    path = _latest_prefix(deal_id, read) + "envelope.json"
     client = blob_service.get_blob_client(container=BLOB_CONTAINER, blob=path)
     client.upload_blob(
         json.dumps(envelope, indent=2, ensure_ascii=False),
@@ -1888,6 +1915,12 @@ def _do_compile(
     # ever produced. Anything keyed on the deal's own identity therefore could
     # not work: the foreign-artifact check declines to guess without it, and
     # correctly emitted nothing on a deal visibly holding another deal's files.
+    if _read_of(job) == DELIVERY_READ:
+        # The delivery read is the planning view, which a compile picks when it has no as_of
+        # (c3_record.view.of_run). A quoting cut left in the manifest would turn it back into a quote read.
+        ctx = manifest.get("context")
+        if isinstance(ctx, dict):
+            manifest = {**manifest, "context": {k: v for k, v in ctx.items() if k not in ("as_of", "quote_asof")}}
     try:
         (project_dir / ".parser_manifest.json").write_text(
             json.dumps(manifest), encoding="utf-8"
@@ -1976,9 +2009,8 @@ def _do_compile(
         # parser-os stage so the UI can render an accurate timeline
         # (current stage + elapsed + ETA) instead of an unbounded spinner.
         compile_started_iso = _iso_now()
-        progress_path = (
-            f"deals/{job.deal_id}/orbitbrief/latest/compile-progress.json"
-        )
+        read = _read_of(job)
+        progress_path = _progress_blob_path(job.deal_id, read)
         progress_started_perf = time.time()
 
         # The last thing the compile told us, so the heartbeat below can re-write
@@ -2241,6 +2273,26 @@ def _do_compile(
             project_dir=project_dir, compile_result=result,
         )
         envelope["compile_id"] = job.compile_id
+        if read == DELIVERY_READ:
+            envelope["read"] = DELIVERY_READ
+            env_path = _upload_envelope(blob_service, job.deal_id, envelope, read)
+            log.info("Uploaded delivery envelope to %s", env_path)
+            _write_compile_progress("done", None, n_stages or 14)
+            # Nothing else: the quoting envelope, scope, SOW draft, trace, atoms and the
+            # change-detection fingerprint all belong to the deal's quoting compile.
+            return {
+                "envelope_path": env_path,
+                "atoms_path": None,
+                "entity_count": len(result.entities),
+                "atom_count": len(result.atoms),
+                "elapsed_sec": elapsed,
+                "sow_version": None,
+                "llm_call_count": len(llm_calls),
+                "compile_state": compile_state,
+                "c3_failures": c3_failures,
+                "c3_notices": c3_notices,
+                "read": DELIVERY_READ,
+            }
 
         # 4b. Also produce scope_process_v1 (DB persistence shape — different
         # from envelope).  Uploaded as a sidecar so the Function App queue
@@ -2259,7 +2311,7 @@ def _do_compile(
         _upload_sheet_renders(blob_service, job.deal_id, project_dir)
 
         # 5a. Upload envelope.json
-        env_path = _upload_envelope(blob_service, job.deal_id, envelope)
+        env_path = _upload_envelope(blob_service, job.deal_id, envelope, read)
         log.info("Uploaded envelope to %s", env_path)
 
         # v58: envelope.json now exists → flip compile-progress to "done".
@@ -2793,7 +2845,7 @@ def main() -> int:
         # (hubspot-sync / orbitbrief-runs re-compiling unchanged deals every cycle)
         # that starve interactive work — no matter how they were enqueued. force
         # bypasses, so a deliberate re-parse always runs.
-        if not job.force and _unchanged_since_last_compile(
+        if not job.force and not _read_of(job) and _unchanged_since_last_compile(
             blob_service, job.deal_id, manifest
         ):
             log.info(
@@ -2868,10 +2920,12 @@ def main() -> int:
         )
 
         # The one OrbitBrief Core notification for this parse (see
-        # _notify_orbitbrief_core). Best-effort; never fails the compile.
-        _notify_orbitbrief_core(
-            queue_service, job, compile_state=result.get("compile_state", "ok"),
-        )
+        # _notify_orbitbrief_core). Best-effort; never fails the compile. A delivery
+        # read has no brief, scope or amount to complete: no notification.
+        if result.get("read") != DELIVERY_READ:
+            _notify_orbitbrief_core(
+                queue_service, job, compile_state=result.get("compile_state", "ok"),
+            )
 
         _safe_delete_queue_message(queue_client, msg, context="compile success")
         _INFLIGHT.clear()
@@ -2887,7 +2941,8 @@ def main() -> int:
         # can HANG and hold the worker slot for many minutes (starving the next
         # reparse). OFF in dev (SOWSMITH_WORKER_RETRAIN=0) so the execution returns
         # the instant the result is delivered → the slot frees immediately.
-        if RETRAIN_ENABLED:
+        # A delivery read never feeds learning: training labels come from the quoting cut only.
+        if RETRAIN_ENABLED and result.get("read") != DELIVERY_READ:
             try:
                 from app.core.type_head import retrain_if_stale
                 retrain_if_stale()
@@ -2918,7 +2973,7 @@ def main() -> int:
         try:
             blob_service.get_blob_client(
                 container=BLOB_CONTAINER,
-                blob=f"deals/{job.deal_id}/orbitbrief/latest/compile-progress.json",
+                blob=_progress_blob_path(job.deal_id, _read_of(job)),
             ).upload_blob(
                 json.dumps({
                     "compile_id": job.compile_id,
