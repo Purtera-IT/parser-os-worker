@@ -283,6 +283,8 @@ def _mark_compile_active(
                 "replica": _REPLICA,
                 "boot_id": _BOOT_ID,
                 "keepalive": _INFLIGHT.get("keepalive"),
+                # A delivery read's progress lives in its own folder; recovery needs to know which.
+                **({"read": DELIVERY_READ} if _read_of(job) else {}),
             }).encode("utf-8"),
             overwrite=True,
             content_type="application/json",
@@ -347,8 +349,32 @@ _BOOT_ID = f"{os.getpid()}-{time.time_ns()}"
 _DO_NOT_RERUN_STAGES = frozenset({"timeout", "killed", "out_of_memory"})
 
 
-def _progress_blob_path(deal_id: str) -> str:
-    return f"deals/{deal_id}/orbitbrief/latest/compile-progress.json"
+#: The delivery read (owner 2026-10-29): the deal read in the planning view -- every line up to our first
+#: kickoff after the win, our signed SOW included -- for the project's Delivery sources page. It is asked
+#: for with ``compile_options.read = "delivery"`` and writes ONLY under ``deals/<id>/delivery/latest/``:
+#: never the quoting envelope, the brief, the SOW draft, the quote or the change-detection fingerprint.
+DELIVERY_READ = "delivery"
+
+
+def _read_of(job: Any) -> str:
+    """``"delivery"`` for a delivery read, else '' (the deal's one quoting/brief compile)."""
+    opts = getattr(job, "compile_options", None)
+    if isinstance(opts, dict):
+        raw = opts.get("read")
+    else:
+        raw = getattr(job, "read", "")
+    return DELIVERY_READ if str(raw or "").strip().lower() == DELIVERY_READ else ""
+
+
+def _latest_prefix(deal_id: str, read: str = "") -> str:
+    """Where a compile's outputs live: the delivery read has its own folder."""
+    if read == DELIVERY_READ:
+        return f"deals/{deal_id}/delivery/latest/"
+    return f"deals/{deal_id}/orbitbrief/latest/"
+
+
+def _progress_blob_path(deal_id: str, read: str = "") -> str:
+    return _latest_prefix(deal_id, read) + "compile-progress.json"
 
 
 def _fail_progress_if_ours(
@@ -373,7 +399,7 @@ def _fail_progress_if_ours(
         from azure.core.exceptions import ResourceNotFoundError
 
         client = blob_service.get_blob_client(
-            container=BLOB_CONTAINER, blob=_progress_blob_path(job.deal_id),
+            container=BLOB_CONTAINER, blob=_progress_blob_path(job.deal_id, _read_of(job)),
         )
         current: dict[str, Any] = {}
         etag = None
@@ -462,8 +488,8 @@ def recover_dead_runs(blob_service: Any, queue_service: Any = None) -> int:
         compile_id, deal_id = marker.get("compile_id"), marker.get("deal_id")
         if not compile_id or not deal_id:
             continue
-        job = SimpleJob(deal_id=str(deal_id), compile_id=str(compile_id))
-        progress = _read_progress(blob_service, job.deal_id)
+        job = SimpleJob(deal_id=str(deal_id), compile_id=str(compile_id), read=_read_of(marker))
+        progress = _read_progress(blob_service, job.deal_id, job.read)
         error = _killed_run_message(
             marker.get("stage") or (progress or {}).get("current_stage"),
             (progress or {}).get("stage_items_done"),
@@ -484,12 +510,13 @@ class SimpleJob:
 
     deal_id: str
     compile_id: str
+    read: str = ""
 
 
-def _read_progress(blob_service: Any, deal_id: str) -> dict[str, Any] | None:
+def _read_progress(blob_service: Any, deal_id: str, read: str = "") -> dict[str, Any] | None:
     try:
         raw = blob_service.get_blob_client(
-            container=BLOB_CONTAINER, blob=_progress_blob_path(deal_id),
+            container=BLOB_CONTAINER, blob=_progress_blob_path(deal_id, read),
         ).download_blob().readall()
         parsed = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace"))
         return parsed if isinstance(parsed, dict) else None
@@ -776,7 +803,7 @@ class _CancelWatcher:
         # The same path `_do_compile` writes its live progress to. Derived
         # rather than passed, so this can be started beside the watchdog in the
         # outer function where the queue message is still in scope.
-        self._progress_path = f"deals/{job.deal_id}/orbitbrief/latest/compile-progress.json"
+        self._progress_path = _progress_blob_path(job.deal_id, _read_of(job))
         self._started_iso = _iso_now()
         self._poll = max(1.0, float(poll_sec))
         self._done = threading.Event()
@@ -1009,7 +1036,7 @@ def _release_inflight(reason: str) -> None:
     try:
         blob_service.get_blob_client(
             container=BLOB_CONTAINER,
-            blob=f"deals/{job.deal_id}/orbitbrief/latest/compile-progress.json",
+            blob=_progress_blob_path(job.deal_id, _read_of(job)),
         ).upload_blob(
             json.dumps({
                 "compile_id": job.compile_id,
@@ -1292,6 +1319,81 @@ def _write_run_index(blob_service: BlobServiceClient, payload: dict[str, Any]) -
         log.warning("Failed to write run index: %s", exc)
 
 
+# The parser's own verdict on a compile (parser-os compile_capabilities):
+#   ok       -- normal
+#   degraded -- a C3 heads read failed on the default path and its lines went
+#               to the LLM / old judge instead (warning + c3_heads_unavailable
+#               event in the parser); the compile is usable but the PM must see it
+#   failed   -- zero evidence atoms; nothing to brief, never "done"
+# An older parser that does not report it is "ok" (the previous behaviour).
+COMPILE_STATES = ("ok", "degraded", "failed")
+
+
+def _compile_state(result: Any) -> tuple[str, list[dict[str, Any]]]:
+    """(compile_state, c3_failures) from a parser-os CompileResult."""
+    caps = getattr(result, "compile_capabilities", None)
+    caps = caps if isinstance(caps, dict) else {}
+    state = str(caps.get("compile_state") or "ok").strip().lower()
+    if state not in COMPILE_STATES:
+        # Unknown verdict from a newer parser: surface it, don't call it ok.
+        state = "degraded"
+    failures = caps.get("c3_failures")
+    return state, (list(failures) if isinstance(failures, list) else [])
+
+
+class CompileStateFailed(RuntimeError):
+    """The parser itself said compile_state == "failed" (zero evidence atoms).
+
+    Deterministic: the same inputs fail the same way, so the message is not
+    retried, no envelope is written over the last good one, and no brief is
+    requested.
+    """
+
+
+def _compile_state_fields(state: str, failures: list[dict[str, Any]],
+                          notices: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The fields the PM page reads: compile_state, degraded, c3_failures, notices."""
+    out: dict[str, Any] = {"compile_state": state, "degraded": state == "degraded"}
+    if failures:
+        out["c3_failures"] = failures[:20]
+    if notices:
+        out["notices"] = dict(notices)
+    return out
+
+
+# What the deal page is told about the C3 heads (parser-os c3_type_base notices):
+#   heads_warming       -- live only: the compile is waiting on a heads service that
+#                          is starting (scale-to-zero cold start, ~4 min); since /
+#                          waited_s / attempts. Gone once the heads answer.
+#   heads_read_degraded -- the heads read the deal in smaller windows than full size
+#                          (out-of-memory retry): {lines, max_atoms, max_atoms_top,
+#                          oom_retries, reads}. Kept on the finished record.
+#   large_deal          -- the heads read more than ~8,000 lines: {lines, threshold}.
+# Copied into compile-progress.json as `notices` on every write; absent when there is
+# nothing to say (warm service, full-size read).
+NOTICE_KEYS = ("heads_warming", "heads_read_degraded", "large_deal")
+
+
+def _live_notices() -> dict[str, Any]:
+    """The running compile's notices (parser-os runs in this process; read from the
+    progress thread like ``stage_progress``). {} from a parser that has none."""
+    try:
+        from app.core import telemetry as _t
+        got = _t.compile_notices()
+    except Exception:
+        return {}
+    return {k: v for k, v in (got or {}).items() if k in NOTICE_KEYS and isinstance(v, dict)}
+
+
+def _compile_notices(result: Any) -> dict[str, Any]:
+    """The finished compile's notices (compile_capabilities.c3_notices): never a wait."""
+    caps = getattr(result, "compile_capabilities", None)
+    got = caps.get("c3_notices") if isinstance(caps, dict) else None
+    if not isinstance(got, dict):
+        return {}
+    return {k: v for k, v in got.items() if k in NOTICE_KEYS and k != "heads_warming" and isinstance(v, dict)}
+
+
 def _write_status(
     blob_service: BlobServiceClient,
     job: JobMessage,
@@ -1389,9 +1491,9 @@ def _unchanged_since_last_compile(
 
 
 def _upload_envelope(
-    blob_service: BlobServiceClient, deal_id: str, envelope: dict[str, Any]
+    blob_service: BlobServiceClient, deal_id: str, envelope: dict[str, Any], read: str = ""
 ) -> str:
-    path = f"deals/{deal_id}/orbitbrief/latest/envelope.json"
+    path = _latest_prefix(deal_id, read) + "envelope.json"
     client = blob_service.get_blob_client(container=BLOB_CONTAINER, blob=path)
     client.upload_blob(
         json.dumps(envelope, indent=2, ensure_ascii=False),
@@ -1443,8 +1545,19 @@ def _forward_to_poison_queue(
         log.warning("Failed to forward poison message to %s: %s", POISON_QUEUE_NAME, exc)
 
 
+def _compile_mode(job: "JobMessage") -> str | None:
+    """``compile_options.mode`` as the producer set it, or None when unset.
+
+    Producers: Platform ``triggerReparseOnly`` sends ``parse_only`` (Re-parse)
+    or ``parse_and_brief`` (Run); passive enqueues send ``parse_and_brief``.
+    """
+    raw = (job.compile_options or {}).get("mode")
+    mode = str(raw or "").strip().lower()
+    return mode or None
+
+
 def _enqueue_brief_gen(
-    queue_service: QueueServiceClient, job: "JobMessage"
+    queue_service: QueueServiceClient, job: "JobMessage", compile_state: str = "ok",
 ) -> None:
     """Notify the brief-gen queue (parser-os-orbitbrief-jobs) that a fresh
     v45.2 envelope has been written.  Function App queueTrigger picks this up
@@ -1466,6 +1579,18 @@ def _enqueue_brief_gen(
         "compileId": job.compile_id,
         "envelopeReady": True,
     }
+    # Carry the producer's compile_options.mode through, so the consumer can
+    # tell "Re-parse" (parse_only) from "Run" (parse_and_brief). The message is
+    # still always sent: the consumer's completion step (attachment status,
+    # scope, amount) must run on every parse, brief or not.
+    mode = _compile_mode(job)
+    if mode:
+        payload["mode"] = mode
+        payload["briefWanted"] = mode != "parse_only"
+    # The parser's verdict, so the consumer / PM page can show a degraded parse.
+    # A failed compile never gets here (no envelope, no message).
+    payload["compileState"] = compile_state
+    payload["degraded"] = compile_state == "degraded"
     try:
         bqc.send_message(json.dumps(payload))
     except Exception:
@@ -1483,61 +1608,30 @@ def _enqueue_brief_gen(
     )
 
 
-def _trigger_brief_gen_http(job: "JobMessage") -> None:
-    """Kick brief-gen (PM_HANDOFF etc.) on orbitbrief-core-worker right after the
-    parse, so the OrbitBrief page is fresh on EVERY run.
+def _notify_orbitbrief_core(
+    queue_service: QueueServiceClient, job: "JobMessage", compile_state: str = "ok",
+) -> None:
+    """Tell OrbitBrief that a fresh envelope exists: exactly ONE notification.
 
-    Queue path (parser-os-orbitbrief-jobs) is the primary notify; this HTTP call
-    is the live backup when the Function App consumer is slow/absent.
-    Best-effort: any failure just leaves the brief stale; it never fails compile.
+    The brief-gen queue message is the only Core notification. The Function App
+    consumer (parser-os-orbitbrief-queue) IS deployed on dev and prod: it runs
+    the completion step (attachment status, scope, amount), inserts the
+    orbitbrief_runs row, and the runs timer dispatches Core with the
+    duplicate-run guard, the concurrency cap, PM-answer replay and stuck-run
+    recovery. The worker used to ALSO POST Core's compile-run route directly,
+    under a comment claiming the consumer wasn't deployed; every deal then
+    compiled twice concurrently and the last writer won latest/. Do not add a
+    second notifier here.
 
-    NOTE: the worker routes HTTP through the Tailscale proxy (for Ollama), but
-    orbitbrief-core-worker is a public Azure ingress URL — so we use an opener with
-    an EMPTY ProxyHandler to connect DIRECT, bypassing the proxy.
+    Best-effort: a failure is logged loudly and never fails the compile.
     """
-    base = os.environ.get("ORBITBRIEF_CORE_WORKER_URL", "").strip()
-    if not base:
-        log.info("ORBITBRIEF_CORE_WORKER_URL unset; skipping brief-gen trigger.")
-        return
-    import time as _time
-    import urllib.error
-    import urllib.request
-    import uuid
-
-    bearer = os.environ.get("ORBITBRIEF_CORE_WORKER_BEARER", "").strip()
-    run_id = uuid.uuid4().hex
-    payload = json.dumps(
-        {"deal_id": job.deal_id, "run_id": run_id, "mirror_latest": True}
-    ).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if bearer:
-        headers["Authorization"] = f"Bearer {bearer}"
-    url = f"{base.rstrip('/')}/v1/compile-run?async=1"
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # direct, no proxy
-    last_exc: Exception | None = None
-    for attempt in range(1, 4):
-        req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
-        try:
-            with opener.open(req, timeout=20) as resp:
-                status = getattr(resp, "status", None) or resp.getcode()
-                if 200 <= int(status) < 300:
-                    log.info(
-                        "Brief-gen triggered (HTTP %s) deal=%s run=%s attempt=%s",
-                        status, job.deal_id, run_id, attempt,
-                    )
-                    return
-                body = resp.read()[:300]
-                last_exc = RuntimeError(f"HTTP {status}: {body!r}")
-        except Exception as exc:
-            last_exc = exc
+    try:
+        _enqueue_brief_gen(queue_service, job, compile_state=compile_state)
+    except Exception as exc:
         log.warning(
-            "Brief-gen HTTP attempt %s failed deal=%s: %s",
-            attempt, job.deal_id, last_exc,
+            "Brief-gen enqueue failed for deal=%s compile=%s: %s",
+            job.deal_id, job.compile_id, exc,
         )
-        _time.sleep(min(2 * attempt, 6))
-    raise RuntimeError(
-        f"Brief-gen HTTP trigger failed after retries deal={job.deal_id}: {last_exc}"
-    )
 
 
 # v56: Side-channel atoms.json with the raw parser-os atom list — bypasses
@@ -1821,6 +1915,16 @@ def _do_compile(
     # ever produced. Anything keyed on the deal's own identity therefore could
     # not work: the foreign-artifact check declines to guess without it, and
     # correctly emitted nothing on a deal visibly holding another deal's files.
+    if _read_of(job) == DELIVERY_READ:
+        # The delivery read is the planning view, which a compile picks when it has no as_of
+        # (c3_record.view.of_run). A quoting cut left in the manifest would turn it back into a quote read.
+        ctx = manifest.get("context")
+        if isinstance(ctx, dict):
+            ctx = {k: v for k, v in ctx.items() if k not in ("as_of", "quote_asof")}
+        else:
+            ctx = {}
+        # parser-os reads context.read to ask the delivery heads and read every line (no cut either end).
+        manifest = {**manifest, "context": {**ctx, "read": DELIVERY_READ}}
     try:
         (project_dir / ".parser_manifest.json").write_text(
             json.dumps(manifest), encoding="utf-8"
@@ -1909,9 +2013,8 @@ def _do_compile(
         # parser-os stage so the UI can render an accurate timeline
         # (current stage + elapsed + ETA) instead of an unbounded spinner.
         compile_started_iso = _iso_now()
-        progress_path = (
-            f"deals/{job.deal_id}/orbitbrief/latest/compile-progress.json"
-        )
+        read = _read_of(job)
+        progress_path = _progress_blob_path(job.deal_id, read)
         progress_started_perf = time.time()
 
         # The last thing the compile told us, so the heartbeat below can re-write
@@ -1984,6 +2087,10 @@ def _do_compile(
                 "stage_items_done": _items_done,
                 "stage_items_total": _items_total,
             }
+            # "Waking up the model" / "read in smaller pieces" / "big deal" (NOTICE_KEYS).
+            _notices = _live_notices()
+            if _notices:
+                payload["notices"] = _notices
             try:
                 blob_service.get_blob_client(
                     container=BLOB_CONTAINER, blob=progress_path,
@@ -2083,6 +2190,20 @@ def _do_compile(
         # document reads "running quality_gates" after envelope.json exists.
         _progress_heartbeat.stop()
 
+        # The parser's verdict, recorded as it said it -- never a silent "done".
+        compile_state, c3_failures = _compile_state(result)
+        c3_notices = _compile_notices(result)
+        if compile_state == "failed":
+            raise CompileStateFailed(
+                f"parser compile_state=failed ({len(getattr(result, 'atoms', []) or [])} "
+                "evidence atoms); not projected, no envelope written, no brief requested"
+            )
+        if compile_state == "degraded":
+            log.warning(
+                "Compile %s for deal %s is DEGRADED: C3 heads unavailable on %d read(s): %s; notices: %s",
+                job.compile_id, job.deal_id, len(c3_failures), c3_failures[:5], c3_notices,
+            )
+
         # v58: the parser STAGES are done — but build_orbitbrief_envelope()
         # below (the OrbitBrief projection: cockpit surfaces, facet sections,
         # service_routing head) still takes ~90s and IS the deliverable the UI
@@ -2129,6 +2250,7 @@ def _do_compile(
                         ),
                         "worker_sha": WORKER_SHA,
                         "parser_os_sha": PARSER_OS_SHA,
+                        **_compile_state_fields(compile_state, c3_failures, c3_notices),
                     }, indent=2, default=str).encode("utf-8"),
                     overwrite=True,
                     content_type="application/json",
@@ -2155,6 +2277,26 @@ def _do_compile(
             project_dir=project_dir, compile_result=result,
         )
         envelope["compile_id"] = job.compile_id
+        if read == DELIVERY_READ:
+            envelope["read"] = DELIVERY_READ
+            env_path = _upload_envelope(blob_service, job.deal_id, envelope, read)
+            log.info("Uploaded delivery envelope to %s", env_path)
+            _write_compile_progress("done", None, n_stages or 14)
+            # Nothing else: the quoting envelope, scope, SOW draft, trace, atoms and the
+            # change-detection fingerprint all belong to the deal's quoting compile.
+            return {
+                "envelope_path": env_path,
+                "atoms_path": None,
+                "entity_count": len(result.entities),
+                "atom_count": len(result.atoms),
+                "elapsed_sec": elapsed,
+                "sow_version": None,
+                "llm_call_count": len(llm_calls),
+                "compile_state": compile_state,
+                "c3_failures": c3_failures,
+                "c3_notices": c3_notices,
+                "read": DELIVERY_READ,
+            }
 
         # 4b. Also produce scope_process_v1 (DB persistence shape — different
         # from envelope).  Uploaded as a sidecar so the Function App queue
@@ -2173,7 +2315,7 @@ def _do_compile(
         _upload_sheet_renders(blob_service, job.deal_id, project_dir)
 
         # 5a. Upload envelope.json
-        env_path = _upload_envelope(blob_service, job.deal_id, envelope)
+        env_path = _upload_envelope(blob_service, job.deal_id, envelope, read)
         log.info("Uploaded envelope to %s", env_path)
 
         # v58: envelope.json now exists → flip compile-progress to "done".
@@ -2332,6 +2474,9 @@ def _do_compile(
             "elapsed_sec": elapsed,
             "sow_version": sow_version,
             "llm_call_count": len(llm_calls),
+            "compile_state": compile_state,
+            "c3_failures": c3_failures,
+            "c3_notices": c3_notices,
         }
     finally:
         # Restore monkey-patched call sites and clean tempdir.
@@ -2704,7 +2849,7 @@ def main() -> int:
         # (hubspot-sync / orbitbrief-runs re-compiling unchanged deals every cycle)
         # that starve interactive work — no matter how they were enqueued. force
         # bypasses, so a deliberate re-parse always runs.
-        if not job.force and _unchanged_since_last_compile(
+        if not job.force and not _read_of(job) and _unchanged_since_last_compile(
             blob_service, job.deal_id, manifest
         ):
             log.info(
@@ -2772,26 +2917,18 @@ def main() -> int:
             atom_count=result["atom_count"],
             elapsed_sec=round(result["elapsed_sec"], 2),
             envelope_path=result["envelope_path"],
+            **_compile_state_fields(
+                result.get("compile_state", "ok"), result.get("c3_failures") or [],
+                result.get("c3_notices") or {},
+            ),
         )
 
-        # Notify brief-gen worker that a fresh v45.2 envelope is ready.
-        # Best-effort — log loudly on failure but don't fail the compile job.
-        try:
-            _enqueue_brief_gen(queue_service, job)
-        except Exception as exc:
-            log.warning(
-                "Brief-gen enqueue failed for deal=%s compile=%s: %s",
-                job.deal_id, job.compile_id, exc,
-            )
-        # The queue consumer above isn't deployed, so ALSO trigger brief-gen
-        # directly over HTTP — this is the live auto-trigger that keeps OrbitBrief
-        # fresh after every parse. Best-effort; never fails the compile.
-        try:
-            _trigger_brief_gen_http(job)
-        except Exception as exc:
-            log.warning(
-                "Brief-gen HTTP trigger failed for deal=%s compile=%s: %s",
-                job.deal_id, job.compile_id, exc,
+        # The one OrbitBrief Core notification for this parse (see
+        # _notify_orbitbrief_core). Best-effort; never fails the compile. A delivery
+        # read has no brief, scope or amount to complete: no notification.
+        if result.get("read") != DELIVERY_READ:
+            _notify_orbitbrief_core(
+                queue_service, job, compile_state=result.get("compile_state", "ok"),
             )
 
         _safe_delete_queue_message(queue_client, msg, context="compile success")
@@ -2808,7 +2945,8 @@ def main() -> int:
         # can HANG and hold the worker slot for many minutes (starving the next
         # reparse). OFF in dev (SOWSMITH_WORKER_RETRAIN=0) so the execution returns
         # the instant the result is delivered → the slot frees immediately.
-        if RETRAIN_ENABLED:
+        # A delivery read never feeds learning: training labels come from the quoting cut only.
+        if RETRAIN_ENABLED and result.get("read") != DELIVERY_READ:
             try:
                 from app.core.type_head import retrain_if_stale
                 retrain_if_stale()
@@ -2839,7 +2977,7 @@ def main() -> int:
         try:
             blob_service.get_blob_client(
                 container=BLOB_CONTAINER,
-                blob=f"deals/{job.deal_id}/orbitbrief/latest/compile-progress.json",
+                blob=_progress_blob_path(job.deal_id, _read_of(job)),
             ).upload_blob(
                 json.dumps({
                     "compile_id": job.compile_id,
@@ -2850,6 +2988,7 @@ def main() -> int:
                     "error": f"{type(exc).__name__}: {exc}"[:500],
                     "worker_sha": WORKER_SHA,
                     "parser_os_sha": PARSER_OS_SHA,
+                    **(_compile_state_fields("failed", []) if isinstance(exc, CompileStateFailed) else {}),
                 }, indent=2, default=str).encode("utf-8"),
                 overwrite=True,
                 content_type="application/json",
@@ -2862,16 +3001,18 @@ def main() -> int:
         # interactive reparses (the dev "zombie storm"). Transient failures still
         # retry.
         msg_l = f"{type(exc).__name__}: {exc}".lower()
-        permanent = (
+        state_failed = isinstance(exc, CompileStateFailed)
+        permanent = state_failed or (
             "blobnotfound" in msg_l
             or "the specified blob does not exist" in msg_l
             or ("notfound" in type(exc).__name__.lower() and "blob" in msg_l)
         )
         _write_status(
             blob_service, job, "failed",
-            stage=("dead_deal" if permanent else "exception"),
+            stage=("no_evidence" if state_failed else "dead_deal" if permanent else "exception"),
             error=f"{type(exc).__name__}: {exc}",
             traceback=traceback.format_exc()[:4000],
+            **(_compile_state_fields("failed", []) if state_failed else {}),
         )
         if permanent:
             log.error("Permanent failure (dead deal / missing blob) — dropping message to break the zombie cycle")
@@ -2888,6 +3029,26 @@ def _sow_draft_status(blob_service: BlobServiceClient, deal_id: str, body: dict[
     blob_service.get_blob_client(
         container=BLOB_CONTAINER, blob=f"deals/{deal_id}/orbitbrief/latest/sow-draft-status.json",
     ).upload_blob(json.dumps(body).encode("utf-8"), overwrite=True)
+
+
+def _sow_draft_summary(c3_sow: dict[str, Any]) -> dict[str, Any]:
+    """What the Studio shows about a written draft, from c3_sow itself: ``draft_status`` (ok | degraded |
+    failed; parser-os ``_draft_status``) with ``failed_because`` / ``degraded_because``, where the sites
+    came from, who chose the job family, and how many lines are deal facts vs template."""
+    c = c3_sow if isinstance(c3_sow, dict) else {}
+    status = str(c.get("draft_status") or ("failed" if c.get("error") else "unknown"))
+    out: dict[str, Any] = {"draft_status": status}
+    if status == "failed":
+        out["failed_because"] = str(c.get("failed_because") or c.get("error") or "the SOW writer gave no reason")[:300]
+    calls = sorted({str(f.get("call")) for f in c.get("llm_failures") or [] if isinstance(f, dict) and f.get("call")})
+    if status == "degraded":
+        out["degraded_because"] = ("LLM call(s) " + ", ".join(calls) + " returned nothing usable; those steps ran without an answer") if calls else "the SOW writer marked it degraded"
+    if calls:
+        out["llm_failures"] = calls
+    for k in ("site_source", "job_family", "job_family_by", "origin_counts"):
+        if c.get(k) is not None:
+            out[k] = c[k]
+    return out
 
 
 def _run_sow_draft(blob_service: BlobServiceClient, deal_id: str, job: dict[str, Any]) -> None:
@@ -2913,20 +3074,33 @@ def _run_sow_draft(blob_service: BlobServiceClient, deal_id: str, job: dict[str,
         env["c3_sow"]["written_at"] = datetime.now(timezone.utc).isoformat()
         env["c3_sow"]["written_on"] = "sowsmith_run"
         _upload_envelope(blob_service, deal_id, env)
+        handoff_error = ""
         try:
             pmh_client = blob_service.get_blob_client(container=BLOB_CONTAINER, blob=latest + "PM_HANDOFF.json")
             pmh = json.loads(pmh_client.download_blob().readall())
             pmh["c3_sow"] = env["c3_sow"]
             pmh_client.upload_blob(json.dumps(pmh).encode("utf-8"), overwrite=True)
         except Exception as exc:  # the Studio reads PM_HANDOFF; say so when it could not be updated
+            handoff_error = f"{type(exc).__name__}: {str(exc)[:160]}"
             log.warning("sow_draft: PM_HANDOFF not updated for %s: %s", deal_id, type(exc).__name__)
+        summary = _sow_draft_summary(env["c3_sow"])
+        if handoff_error:
+            # The draft was written to the envelope but the Studio reads PM_HANDOFF, which still holds
+            # the previous draft: "done / ok" here showed the PM a stale SOW as the new one.
+            summary["draft_status"] = "failed" if summary.get("draft_status") == "failed" else "degraded"
+            summary["degraded_because"] = "; ".join(x for x in (
+                summary.get("degraded_because"), f"PM_HANDOFF not updated ({handoff_error}): the Studio still "
+                "shows the previous draft") if x)
         _sow_draft_status(blob_service, deal_id, {**base, "state": "done", "seconds": round(time.monotonic() - t0, 1),
                                                    "compile_id": env.get("compile_id"),
-                                                   "locations": len(env["c3_sow"].get("locations") or [])})
+                                                   "locations": len(env["c3_sow"].get("locations") or []),
+                                                   **summary})
         log.info("sow_draft: %s written in %.1fs", deal_id, time.monotonic() - t0)
     except Exception as exc:
         log.exception("sow_draft failed for %s", deal_id)
-        _sow_draft_status(blob_service, deal_id, {**base, "state": "failed", "error": f"{type(exc).__name__}: {str(exc)[:200]}"})
+        _sow_draft_status(blob_service, deal_id, {**base, "state": "failed", "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                                                   "draft_status": "failed",
+                                                   "failed_because": f"{type(exc).__name__}: {str(exc)[:200]}"})
 
 
 if __name__ == "__main__":
