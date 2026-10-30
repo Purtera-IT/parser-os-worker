@@ -1920,7 +1920,11 @@ def _do_compile(
         # (c3_record.view.of_run). A quoting cut left in the manifest would turn it back into a quote read.
         ctx = manifest.get("context")
         if isinstance(ctx, dict):
-            manifest = {**manifest, "context": {k: v for k, v in ctx.items() if k not in ("as_of", "quote_asof")}}
+            ctx = {k: v for k, v in ctx.items() if k not in ("as_of", "quote_asof")}
+        else:
+            ctx = {}
+        # parser-os reads context.read to ask the delivery heads and read every line (no cut either end).
+        manifest = {**manifest, "context": {**ctx, "read": DELIVERY_READ}}
     try:
         (project_dir / ".parser_manifest.json").write_text(
             json.dumps(manifest), encoding="utf-8"

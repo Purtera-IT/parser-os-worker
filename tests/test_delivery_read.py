@@ -70,3 +70,8 @@ def test_no_core_notification_and_no_learning():
 def test_delivery_strips_the_quoting_cut():
     src = inspect.getsource(m._do_compile)
     assert 'k not in ("as_of", "quote_asof")' in src
+
+
+def test_delivery_tells_the_parser_it_is_a_delivery_read():
+    src = inspect.getsource(m._do_compile)
+    assert '"read": DELIVERY_READ}' in src
