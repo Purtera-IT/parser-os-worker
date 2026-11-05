@@ -132,7 +132,11 @@ try:
         return False
 
     n = skipped = 0
+    #: Top-level names the blob store can actually supply, so a configured path
+    #: with no source anywhere is told apart from one the fetch failed to land.
+    seen_roots: set[str] = set()
     for b in cc.list_blobs():
+        seen_roots.add(str(b.name).split("/", 1)[0])
         if _skip(b.name):
             skipped += 1
             continue
@@ -191,6 +195,7 @@ try:
                 except TypeError:
                     tf.extractall(outd)
             print(f"fetch_ml: extracted {name} -> {outd}")
+            seen_roots.add(sub.lstrip("/"))
             _drop_archive(tp, name)
         except Exception as ex:
             extract_errors.append(f"{name}: {type(ex).__name__}: {ex}")
@@ -215,6 +220,8 @@ try:
                 except TypeError:
                     tf.extractall(DST)
             print(f"fetch_ml: extracted {name} -> {DST}")
+            for _root in os.listdir(DST):
+                seen_roots.add(_root)
             _drop_archive(tp, name)
         except Exception as ex:
             extract_errors.append(f"{name}: {type(ex).__name__}: {ex}")
@@ -225,13 +232,32 @@ try:
     # be on disk. This is the check whose absence let a quoteless envelope look
     # exactly like a normal one.
     required = _required_paths()
-    missing = sorted(k for k, p in required.items() if not os.path.exists(p))
+    absent = {k: p for k, p in required.items() if not os.path.exists(p)}
+
+    def _root_of(path: str) -> str:
+        rel = os.path.relpath(os.path.realpath(path), os.path.realpath(DST))
+        return rel.split(os.sep, 1)[0]
+
+    # A path the blob store has no source for was never going to arrive: that is
+    # DEAD CONFIG, not a fetch that broke, and failing the boot on it would take
+    # the worker down for something no fetch could ever fix. Live example:
+    # SOWSMITH_CALIBRATOR_PATH=/tmp/ml/_calibrator/calibrator.joblib is set on
+    # dev AND prod, while the only calibrator ever in ml-artifacts is
+    # `_quarantine/calibrator_leaked_20260804.joblib`, quarantined 2026-08-04 --
+    # and nothing reads it either (the worker calls compile_project() without
+    # calibrator_path). Say so loudly, every boot, and carry on.
+    no_source = sorted(k for k, p in absent.items() if _root_of(p) not in seen_roots)
+    missing = sorted(k for k in absent if k not in no_source)
     receipt["required"] = required
     receipt["missing"] = missing
-    receipt["present"] = sorted(k for k in required if k not in missing)
+    receipt["no_source"] = no_source
+    receipt["present"] = sorted(k for k in required if k not in absent)
+    for k in no_source:
+        print(f"fetch_ml: DEAD CONFIG {k}={required[k]} — ml-artifacts has no source for it; "
+              f"nothing can load this. Unset it or publish the artifact.", file=sys.stderr)
     if missing:
         detail = ", ".join(f"{k}={required[k]}" for k in missing)
-        _die(f"{len(missing)} configured artifact(s) missing after fetch: {detail}", receipt)
+        _die(f"{len(missing)} configured artifact(s) the store HAS but the fetch did not land: {detail}", receipt)
     if extract_errors:
         _die("extract failed: " + "; ".join(extract_errors), receipt)
 
