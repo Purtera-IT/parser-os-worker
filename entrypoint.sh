@@ -93,9 +93,19 @@ if [[ -z "${OLLAMA_HOST_PROXY:-}" && -n "${OLLAMA_HOST:-}" ]]; then
 fi
 export OLLAMA_HOST="${OLLAMA_HOST_TAILSCALE:-http://100.114.102.122:11434}"
 
-# Fetch ML deflector artifacts (non-fatal) so the #70/#71 heads + kNN
-# store fire live; missing -> deflectors abstain -> LLM-only path.
-python /fetch_ml.py || echo "fetch_ml skipped" >&2
+# Fetch ML artifacts (heads + kNN stores + TrainingLog) so the heads fire live.
+#
+# FATAL ON PURPOSE (2026-11-05). This was `python /fetch_ml.py || echo
+# "fetch_ml skipped" >&2`, which meant a worker that fetched nothing booted and
+# served compiles with every head inert — producing envelopes with no c3_brief
+# and no sign anywhere that the heads never ran. A worker that cannot load its
+# heads must not take work off the queue; crash-looping is loud, and Container
+# Apps retries it. `ML_ARTIFACTS_OPTIONAL=1` restores the old behaviour by name,
+# for a runtime genuinely meant to serve without heads.
+if ! python /fetch_ml.py; then
+  echo "entrypoint: fetch_ml failed; refusing to start (set ML_ARTIFACTS_OPTIONAL=1 to serve without heads)" >&2
+  exit 1
+fi
 
 # Scrub leftover compile workdirs from prior crashes / OOM kills so /tmp
 # cannot fill again (Errno 28 disk-full → mass queue poison).
