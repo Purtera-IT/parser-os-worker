@@ -29,6 +29,30 @@ until [[ -S /tmp/tailscaled.sock ]]; do
 done
 sleep 0.5
 
+# ML artifacts first: the no-Tailscale fallback below ends in `exec "$@"`,
+# which replaced this shell ~70 lines before fetch_ml ever ran. TS_AUTHKEY
+# is set on NEITHER dev nor prod, so that branch is the one both take on
+# every boot -- fetch_ml has never run in either environment, and every
+# compile has served with the local heads (type head, span heads,
+# contrastive stores, rubric gate, pdf image gate/veto, service router,
+# calibrator) and the TrainingLog missing from /tmp/ml. The 2026-11-05
+# compile manifest put numbers on it: 11 of 12 configured artifacts absent.
+# fetch_ml talks to Azure blob storage over the ordinary network and needs
+# no tailnet, so it belongs above the fallback, not below it.
+# Fetch ML artifacts (heads + kNN stores + TrainingLog) so the heads fire live.
+#
+# FATAL ON PURPOSE (2026-11-05). This was `python /fetch_ml.py || echo
+# "fetch_ml skipped" >&2`, which meant a worker that fetched nothing booted and
+# served compiles with every head inert — producing envelopes with no c3_brief
+# and no sign anywhere that the heads never ran. A worker that cannot load its
+# heads must not take work off the queue; crash-looping is loud, and Container
+# Apps retries it. `ML_ARTIFACTS_OPTIONAL=1` restores the old behaviour by name,
+# for a runtime genuinely meant to serve without heads.
+if ! python /fetch_ml.py; then
+  echo "entrypoint: fetch_ml failed; refusing to start (set ML_ARTIFACTS_OPTIONAL=1 to serve without heads)" >&2
+  exit 1
+fi
+
 if [[ -z "${TS_AUTHKEY:-}" ]]; then
   echo "TS_AUTHKEY is required — falling back to proxy (no Tailscale)" >&2
   # Don't fail; allow the worker to run via the existing proxy if auth
@@ -93,19 +117,6 @@ if [[ -z "${OLLAMA_HOST_PROXY:-}" && -n "${OLLAMA_HOST:-}" ]]; then
 fi
 export OLLAMA_HOST="${OLLAMA_HOST_TAILSCALE:-http://100.114.102.122:11434}"
 
-# Fetch ML artifacts (heads + kNN stores + TrainingLog) so the heads fire live.
-#
-# FATAL ON PURPOSE (2026-11-05). This was `python /fetch_ml.py || echo
-# "fetch_ml skipped" >&2`, which meant a worker that fetched nothing booted and
-# served compiles with every head inert — producing envelopes with no c3_brief
-# and no sign anywhere that the heads never ran. A worker that cannot load its
-# heads must not take work off the queue; crash-looping is loud, and Container
-# Apps retries it. `ML_ARTIFACTS_OPTIONAL=1` restores the old behaviour by name,
-# for a runtime genuinely meant to serve without heads.
-if ! python /fetch_ml.py; then
-  echo "entrypoint: fetch_ml failed; refusing to start (set ML_ARTIFACTS_OPTIONAL=1 to serve without heads)" >&2
-  exit 1
-fi
 
 # Scrub leftover compile workdirs from prior crashes / OOM kills so /tmp
 # cannot fill again (Errno 28 disk-full → mass queue poison).
