@@ -72,8 +72,12 @@ def _required_paths() -> dict:
     for key, val in os.environ.items():
         if not key.startswith("SOWSMITH_") or not val.strip():
             continue
-        if not (key.endswith("_DIR") or key.endswith("_DB") or key.endswith("_PATH")):
-            continue
+        # Keyed on what the VALUE is, not what the NAME looks like. Matching
+        # `_DIR`/`_DB`/`_PATH` suffixes let SOWSMITH_ADMISSION_REGISTRY
+        # (=/tmp/ml/_admission_heads) straight through the gate -- and that is
+        # the one artifact here with a live call path and no C3 replacement
+        # (`col:admission` is `no_labels` and replaces "parser: span_admission
+        # (lessons)"). A name pattern decided what got checked; now the path does.
         p = val.strip()
         if os.path.realpath(p) == base or not os.path.realpath(p).startswith(base + os.sep):
             continue                                   # not under the ML dir (e.g. /tmp/_feedback.db)
