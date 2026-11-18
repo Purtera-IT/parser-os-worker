@@ -70,15 +70,31 @@ jobs:
         with:
           path: parser-os-worker
 
+      # parser-os went internal/private on 2026-11-16, so its checkout needs a
+      # credential again (unauthenticated it fails "Repository not found" and
+      # nothing deploys). Preferred: a GitHub App with Contents: read on
+      # parser-os, set as repo variable PARSER_OS_APP_ID + secret
+      # PARSER_OS_APP_KEY; its token is minted per run and never expires.
+      # Until then the GH_REPO_TOKEN PAT is used. Only this checkout gets the
+      # credential: parser-os-service and SowSmith stay public and
+      # unauthenticated, so an expired PAT cannot widen into a total outage.
+      - name: Token for parser-os (GitHub App)
+        id: pos_app
+        if: ${{ vars.PARSER_OS_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.PARSER_OS_APP_ID }}
+          private-key: ${{ secrets.PARSER_OS_APP_KEY }}
+          owner: Purtera-IT
+          repositories: parser-os
+
       - name: Checkout parser-os
         uses: actions/checkout@v4
         with:
           repository: Purtera-IT/parser-os
           ref: ${{ github.event.inputs.parser_os_ref || 'main' }}
           path: parser-os
-          # parser-os is public: no credential needed. It used to pass
-          # GH_REPO_TOKEN, which meant an expired PAT failed this checkout too —
-          # widening a one-repo problem into a total deploy outage.
+          token: ${{ steps.pos_app.outputs.token || secrets.GH_REPO_TOKEN }}
 
       - name: Checkout parser-os-service
         uses: actions/checkout@v4
@@ -95,7 +111,7 @@ jobs:
           repository: Purtera-IT/SowSmith
           ref: main
           path: SowSmith
-          # SowSmith is public: no credential needed (see parser-os above).
+          # SowSmith is public: no credential needed.
 
       - name: Capture parser-os SHA
         id: pos
